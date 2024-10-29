@@ -24,3 +24,4 @@ Cargo.lock
 
 /target
 /logs
+.DS_Store

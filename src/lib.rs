@@ -496,24 +496,17 @@ impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for LogRoller {
     type Writer = RollingWriter<'a>;
 
     fn make_writer(&'a self) -> Self::Writer {
-        // let now = self.now();
-
-        // Should we try to roll over the log file?
-        // if self.meta.should_rollover() {
-        // Did we get the right to lock the file? If not, another thread
-        // did it and we can just make a writer.
-        // if self.state.advance_date(now, current_time) {
-        //     self.state.refresh_writer(now, &mut self.writer.write());
-        // }
-        // self.meta.refresh_writer(self.writer.get_mut().unwrap_or_else(PoisonError::into_inner));
-        // self.meta.next_time = Some(
-        //     LogRollerMeta::next_time(
-        //         LogRollerMeta::now(self.meta.time_zone.to_owned()),
-        //         RotationAge::Minutely,
-        //     )
-        //     .unwrap(),
-        // );
-        // }
+        let old_log_path = self.state.curr_file_path.to_owned();
+        if let Ok(new_log_path) = Self::should_rollover(&self.meta, &self.state) {
+            let _ = self
+                .meta
+                .refresh_writer(
+                    &mut self.writer.write().unwrap_or_else(PoisonError::into_inner),
+                    old_log_path,
+                    new_log_path.to_owned(),
+                )
+                .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()));
+        }
         RollingWriter(self.writer.read().unwrap_or_else(PoisonError::into_inner))
     }
 }
