@@ -63,7 +63,7 @@ struct LogRollerMeta {
     filename: PathBuf,
     rotation: Rotation,
     time_zone: TimeZone,
-    compression: Compression,
+    compression: Option<Compression>,
     // max_size: Option<u64>,
 }
 
@@ -205,7 +205,16 @@ impl LogRollerMeta {
         Ok(log_file)
     }
 
-    fn compress(compression: &Compression, log_path: &PathBuf) -> Result<(), LogRollerError> {
+    fn compress(
+        compression: &Option<Compression>,
+        log_path: &PathBuf,
+    ) -> Result<(), LogRollerError> {
+        let compression = match compression {
+            Some(compression) => compression,
+            None => {
+                return Ok(());
+            }
+        };
         match compression {
             Compression::Gzip => {
                 let infile = fs::File::open(log_path).map_err(LogRollerError::FileIOError)?;
@@ -299,7 +308,7 @@ impl LogRollerMeta {
             filename: filename.as_ref().to_path_buf(),
             rotation: Rotation::AgeBased(RotationAge::Daily),
             time_zone: TimeZone::Local,
-            compression: Compression::Gzip,
+            compression: None,
         }
     }
 
@@ -419,7 +428,7 @@ impl LogRollerBuilder {
     pub fn compression(self, compression: Compression) -> Self {
         Self {
             meta: LogRollerMeta {
-                compression,
+                compression: Some(compression),
                 ..self.meta
             },
         }
