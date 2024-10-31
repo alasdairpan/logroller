@@ -1,5 +1,6 @@
 use chrono::{DateTime, FixedOffset, Local, NaiveTime, Timelike, Utc};
 use flate2::write::GzEncoder;
+use regex::Regex;
 use std::{
     fmt::Debug,
     fs,
@@ -64,7 +65,7 @@ struct LogRollerMeta {
     rotation: Rotation,
     time_zone: TimeZone,
     compression: Option<Compression>,
-    // max_keep_files: Option<u64>,
+    max_keep_files: Option<u64>,
     // max_compressed_files: Option<u64>,
 }
 
@@ -212,6 +213,81 @@ impl LogRollerMeta {
         Ok(log_file)
     }
 
+    fn process_old_logs(meta: &LogRollerMeta, log_path: &PathBuf) -> Result<(), LogRollerError> {
+        Self::compress(&meta.compression, log_path)?;
+        Self::prune(
+            &meta.directory,
+            meta.filename
+                .as_path()
+                .as_os_str()
+                .to_string_lossy()
+                .as_ref(),
+            &meta.rotation,
+            meta.max_keep_files,
+        )?;
+        Ok(())
+    }
+
+    fn prune(
+        directory: &PathBuf,
+        filename: &str,
+        rotation: &Rotation,
+        max_keep_files: Option<u64>,
+    ) -> Result<(), LogRollerError> {
+        let max_keep_files = match max_keep_files {
+            Some(max_keep_files) => max_keep_files,
+            None => {
+                return Ok(());
+            }
+        };
+        let file_pattern = match rotation {
+            Rotation::SizeBased(_) => Regex::new(&format!(r"^{filename}(\.\d+)?(\.gz)?$"))
+                .map_err(|err| LogRollerError::InternalError(err.to_string()))?,
+            Rotation::AgeBased(rotation_age) => {
+                let pattern = match rotation_age {
+                    RotationAge::Minutely => r"\d{4}-\d{2}-\d{2}-\d{2}-\d{2}",
+                    RotationAge::Hourly => r"\d{4}-\d{2}-\d{2}-\d{2}",
+                    RotationAge::Daily => r"\d{4}-\d{2}-\d{2}",
+                };
+                Regex::new(&format!(r"^{filename}\.{pattern}(\.gz)?$"))
+                    .map_err(|err| LogRollerError::InternalError(err.to_string()))?
+            }
+        };
+
+        let files = fs::read_dir(directory)
+            .map_err(|err| LogRollerError::InternalError(err.to_string()))?;
+
+        let mut all_files = Vec::new();
+        for file in files.flatten() {
+            let metadata = file.metadata().map_err(LogRollerError::FileIOError)?;
+            if !metadata.is_file() {
+                continue;
+            }
+            if let Some(file_name) = file.file_name().to_str() {
+                if file_pattern.is_match(file_name) {
+                    all_files.push((metadata.created()?, file));
+                }
+            }
+        }
+
+        if all_files.len() < max_keep_files as usize {
+            return Ok(());
+        }
+
+        all_files.sort_by_key(|(created_at, _)| created_at.to_owned());
+
+        for (_, file) in all_files
+            .iter()
+            .take(all_files.len() - max_keep_files as usize)
+        {
+            if let Err(remove_log_file_err) = fs::remove_file(file.path()) {
+                eprintln!("Couldn't remove log file: {remove_log_file_err:?}");
+            }
+        }
+
+        Ok(())
+    }
+
     fn compress(
         compression: &Option<Compression>,
         log_path: &PathBuf,
@@ -232,11 +308,8 @@ impl LogRollerMeta {
                         .map_err(LogRollerError::FileIOError)?;
                 let writer = io::BufWriter::new(outfile);
 
-                // Create a GzEncoder to compress the file
                 let mut encoder = GzEncoder::new(writer, flate2::Compression::default());
-                // Copy the content from the input file to the encoder (which compresses it)
                 io::copy(&mut io::Read::take(reader, u64::MAX), &mut encoder)?;
-                // Finish the compression
                 encoder.finish()?;
 
                 fs::remove_file(log_path).map_err(LogRollerError::FileIOError)?;
@@ -253,10 +326,10 @@ impl LogRollerMeta {
     fn refresh_writer(
         &self,
         writer: &mut fs::File,
-        olg_log_path: PathBuf,
+        old_log_path: PathBuf,
         new_log_path: PathBuf,
     ) -> Result<(), LogRollerError> {
-        let compression = self.compression.to_owned();
+        let meta = self.to_owned();
         match &self.rotation {
             Rotation::SizeBased(_) => {
                 let curr_log_path = self.directory.join(&self.filename);
@@ -271,7 +344,7 @@ impl LogRollerMeta {
                         *writer = log_file;
 
                         std::thread::spawn(move || {
-                            if let Err(err) = Self::compress(&compression, &new_log_path) {
+                            if let Err(err) = Self::process_old_logs(&meta, &new_log_path) {
                                 eprintln!("Couldn't compress log file: {}", err);
                             }
                         });
@@ -289,7 +362,7 @@ impl LogRollerMeta {
                     *writer = log_file;
 
                     std::thread::spawn(move || {
-                        if let Err(err) = Self::compress(&compression, &olg_log_path) {
+                        if let Err(err) = Self::process_old_logs(&meta, &old_log_path) {
                             eprintln!("Couldn't compress log file: {}", err);
                         }
                     });
@@ -311,7 +384,7 @@ impl LogRollerMeta {
             rotation: Rotation::AgeBased(RotationAge::Daily),
             time_zone: TimeZone::Local,
             compression: None,
-            // max_keep_files: None,
+            max_keep_files: None,
             // max_compressed_files: None,
         }
     }
@@ -366,6 +439,8 @@ pub enum LogRollerError {
     FileIOError(#[from] std::io::Error),
     #[error("Should not rotate right now")]
     ShouldNotRotate,
+    #[error("Internal error: {0}")]
+    InternalError(String),
 }
 
 pub struct LogRollerBuilder {
@@ -401,6 +476,15 @@ impl LogRollerBuilder {
         Self {
             meta: LogRollerMeta {
                 compression: Some(compression),
+                ..self.meta
+            },
+        }
+    }
+
+    pub fn max_keep_files(self, max_keep_files: u64) -> Self {
+        Self {
+            meta: LogRollerMeta {
+                max_keep_files: Some(max_keep_files),
                 ..self.meta
             },
         }

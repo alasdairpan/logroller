@@ -4,6 +4,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let appender = LogRollerBuilder::new("./logs", "tracing.log")
         .rotation(Rotation::AgeBased(RotationAge::Minutely))
+        .max_keep_files(3)
         .compression(Compression::Gzip)
         .build()?;
     let (non_blocking, _guard) = tracing_appender::non_blocking(appender);
