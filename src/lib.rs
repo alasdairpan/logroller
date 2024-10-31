@@ -111,54 +111,31 @@ pub struct LogRoller {
 }
 
 impl LogRoller {
-    fn should_rollover(
-        meta: &LogRollerMeta,
-        state: &LogRollerState,
-    ) -> Result<PathBuf, LogRollerError> {
+    fn should_rollover(meta: &LogRollerMeta, state: &LogRollerState) -> Option<PathBuf> {
         match &meta.rotation {
             Rotation::SizeBased(rotation_size) => {
                 if state.curr_file_size_bytes >= rotation_size.bytes() {
-                    return match &meta.rotation {
-                        Rotation::AgeBased(_) => Err(LogRollerError::InvalidRotationType),
-                        Rotation::SizeBased(_) => Ok(meta.directory.join(PathBuf::from(
+                    return Some(
+                        meta.directory.join(PathBuf::from(
                             format!(
                                 "{}.{}",
                                 meta.filename.as_path().to_string_lossy(),
                                 state.next_size_based_index
                             )
                             .to_string(),
-                        ))),
-                    };
+                        )),
+                    );
                 }
             }
-            Rotation::AgeBased(_) => {
+            Rotation::AgeBased(rotation_age) => {
                 let now = meta.now();
                 let next_time = state.next_age_based_time;
                 if now >= next_time {
-                    return match &meta.rotation {
-                        Rotation::SizeBased(_) => Err(LogRollerError::InvalidRotationType),
-                        Rotation::AgeBased(rotation_age) => {
-                            let path_fn = |pattern: &str| -> PathBuf {
-                                meta.directory.join(PathBuf::from(
-                                    next_time
-                                        .format(&format!(
-                                            "{}.{pattern}",
-                                            meta.filename.as_path().to_string_lossy()
-                                        ))
-                                        .to_string(),
-                                ))
-                            };
-                            Ok(match rotation_age {
-                                RotationAge::Minutely => path_fn("%Y-%m-%d-%H-%M"),
-                                RotationAge::Hourly => path_fn("%Y-%m-%d-%H"),
-                                RotationAge::Daily => path_fn("%Y-%m-%d"),
-                            })
-                        }
-                    };
+                    return Some(meta.get_next_age_based_log_path(rotation_age, &next_time));
                 }
             }
         }
-        Err(LogRollerError::ShouldNotRotate)
+        None
     }
 }
 
@@ -339,25 +316,33 @@ impl LogRollerMeta {
         }
     }
 
+    fn get_next_age_based_log_path(
+        &self,
+        rotation_age: &RotationAge,
+        datetime: &DateTime<FixedOffset>,
+    ) -> PathBuf {
+        let path_fn = |pattern: &str| -> PathBuf {
+            self.directory.join(PathBuf::from(
+                datetime
+                    .format(&format!(
+                        "{}.{pattern}",
+                        self.filename.as_path().to_string_lossy()
+                    ))
+                    .to_string(),
+            ))
+        };
+        match rotation_age {
+            RotationAge::Minutely => path_fn("%Y-%m-%d-%H-%M"),
+            RotationAge::Hourly => path_fn("%Y-%m-%d-%H"),
+            RotationAge::Daily => path_fn("%Y-%m-%d"),
+        }
+    }
+
     fn get_curr_log_path(&self) -> PathBuf {
         match &self.rotation {
             Rotation::SizeBased(_) => self.directory.join(self.filename.as_path()),
             Rotation::AgeBased(rotation_age) => {
-                let now = self.now();
-                let path_fn = |pattern: &str| -> PathBuf {
-                    self.directory.join(PathBuf::from(
-                        now.format(&format!(
-                            "{}.{pattern}",
-                            self.filename.as_path().to_string_lossy()
-                        ))
-                        .to_string(),
-                    ))
-                };
-                match rotation_age {
-                    RotationAge::Minutely => path_fn("%Y-%m-%d-%H-%M"),
-                    RotationAge::Hourly => path_fn("%Y-%m-%d-%H"),
-                    RotationAge::Daily => path_fn("%Y-%m-%d"),
-                }
+                self.get_next_age_based_log_path(rotation_age, &self.now())
             }
         }
     }
@@ -455,7 +440,7 @@ impl io::Write for LogRoller {
             .unwrap_or_else(PoisonError::into_inner);
 
         let old_log_path = self.state.curr_file_path.to_owned();
-        if let Ok(new_log_path) = Self::should_rollover(&self.meta, &self.state) {
+        if let Some(new_log_path) = Self::should_rollover(&self.meta, &self.state) {
             self.meta
                 .refresh_writer(writer, old_log_path, new_log_path.to_owned())
                 .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
@@ -493,7 +478,7 @@ impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for LogRoller {
 
     fn make_writer(&'a self) -> Self::Writer {
         let old_log_path = self.state.curr_file_path.to_owned();
-        if let Ok(new_log_path) = Self::should_rollover(&self.meta, &self.state) {
+        if let Some(new_log_path) = Self::should_rollover(&self.meta, &self.state) {
             let _ = self
                 .meta
                 .refresh_writer(
