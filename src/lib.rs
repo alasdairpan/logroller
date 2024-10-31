@@ -3,10 +3,11 @@ use flate2::write::GzEncoder;
 use regex::Regex;
 use std::{
     fmt::Debug,
-    fs,
+    fs::{self, DirEntry},
     io::{self, Write as _},
     path::{Path, PathBuf},
     sync::{PoisonError, RwLock, RwLockReadGuard},
+    time::SystemTime,
 };
 
 #[derive(Debug, Clone)]
@@ -66,7 +67,6 @@ struct LogRollerMeta {
     time_zone: TimeZone,
     compression: Option<Compression>,
     max_keep_files: Option<u64>,
-    // max_compressed_files: Option<u64>,
 }
 
 struct LogRollerState {
@@ -209,13 +209,12 @@ impl LogRollerMeta {
 
         let log_file =
             create_log_file_res.map_err(|err| LogRollerError::CreateFileFailed(err.to_string()))?;
-
         Ok(log_file)
     }
 
     fn process_old_logs(meta: &LogRollerMeta, log_path: &PathBuf) -> Result<(), LogRollerError> {
         Self::compress(&meta.compression, log_path)?;
-        Self::prune(
+        let all_log_files = Self::list_all_files(
             &meta.directory,
             meta.filename
                 .as_path()
@@ -223,23 +222,28 @@ impl LogRollerMeta {
                 .to_string_lossy()
                 .as_ref(),
             &meta.rotation,
-            meta.max_keep_files,
         )?;
+
+        let max_keep_files = meta.max_keep_files.unwrap_or(u64::MAX);
+        if all_log_files.len() > max_keep_files as usize {
+            for (_, file) in all_log_files
+                .iter()
+                .take(all_log_files.len() - max_keep_files as usize)
+            {
+                if let Err(remove_log_file_err) = fs::remove_file(file.path()) {
+                    eprintln!("Couldn't remove log file: {remove_log_file_err:?}");
+                }
+            }
+        }
+
         Ok(())
     }
 
-    fn prune(
+    fn list_all_files(
         directory: &PathBuf,
         filename: &str,
         rotation: &Rotation,
-        max_keep_files: Option<u64>,
-    ) -> Result<(), LogRollerError> {
-        let max_keep_files = match max_keep_files {
-            Some(max_keep_files) => max_keep_files,
-            None => {
-                return Ok(());
-            }
-        };
+    ) -> Result<Vec<(SystemTime, DirEntry)>, LogRollerError> {
         let file_pattern = match rotation {
             Rotation::SizeBased(_) => Regex::new(&format!(r"^{filename}(\.\d+)?(\.gz)?$"))
                 .map_err(|err| LogRollerError::InternalError(err.to_string()))?,
@@ -257,7 +261,7 @@ impl LogRollerMeta {
         let files = fs::read_dir(directory)
             .map_err(|err| LogRollerError::InternalError(err.to_string()))?;
 
-        let mut all_files = Vec::new();
+        let mut all_log_files = Vec::new();
         for file in files.flatten() {
             let metadata = file.metadata().map_err(LogRollerError::FileIOError)?;
             if !metadata.is_file() {
@@ -265,27 +269,14 @@ impl LogRollerMeta {
             }
             if let Some(file_name) = file.file_name().to_str() {
                 if file_pattern.is_match(file_name) {
-                    all_files.push((metadata.created()?, file));
+                    all_log_files.push((metadata.created()?, file));
                 }
             }
         }
 
-        if all_files.len() < max_keep_files as usize {
-            return Ok(());
-        }
+        all_log_files.sort_by_key(|(created_at, _)| created_at.to_owned());
 
-        all_files.sort_by_key(|(created_at, _)| created_at.to_owned());
-
-        for (_, file) in all_files
-            .iter()
-            .take(all_files.len() - max_keep_files as usize)
-        {
-            if let Err(remove_log_file_err) = fs::remove_file(file.path()) {
-                eprintln!("Couldn't remove log file: {remove_log_file_err:?}");
-            }
-        }
-
-        Ok(())
+        Ok(all_log_files)
     }
 
     fn compress(
@@ -385,7 +376,6 @@ impl LogRollerMeta {
             time_zone: TimeZone::Local,
             compression: None,
             max_keep_files: None,
-            // max_compressed_files: None,
         }
     }
 
