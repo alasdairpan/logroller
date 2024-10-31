@@ -2,6 +2,14 @@
 name = "logroller"
 version = "0.1.0"
 edition = "2021"
+authors = ["Trayvon Pan <trayvonpan@gmail.com>"]
+categories = ["development-tools:debugging"]
+description = "A Rust library for automatic file rotation, working with the `tracing-appender` crate."
+documentation = "https://docs.rs/logroller/"
+keywords = ["logging", "tracing", "tracing-appender"]
+license = "GPL-3.0"
+repository = "https://github.com/trayvonpan/logroller/"
+readme = "README.md"
 
 [workspace.dependencies]
 tracing-subscriber = { version = "0.3" }
