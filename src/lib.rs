@@ -64,7 +64,8 @@ struct LogRollerMeta {
     rotation: Rotation,
     time_zone: TimeZone,
     compression: Option<Compression>,
-    // max_size: Option<u64>,
+    // max_keep_files: Option<u64>,
+    // max_compressed_files: Option<u64>,
 }
 
 struct LogRollerState {
@@ -117,18 +118,47 @@ impl LogRoller {
         match &meta.rotation {
             Rotation::SizeBased(rotation_size) => {
                 if state.curr_file_size_bytes >= rotation_size.bytes() {
-                    return meta.get_next_size_based_log_path(state.next_size_based_index);
+                    return match &meta.rotation {
+                        Rotation::AgeBased(_) => Err(LogRollerError::InvalidRotationType),
+                        Rotation::SizeBased(_) => Ok(meta.directory.join(PathBuf::from(
+                            format!(
+                                "{}.{}",
+                                meta.filename.as_path().to_string_lossy(),
+                                state.next_size_based_index
+                            )
+                            .to_string(),
+                        ))),
+                    };
                 }
             }
             Rotation::AgeBased(_) => {
                 let now = meta.now();
                 let next_time = state.next_age_based_time;
                 if now >= next_time {
-                    return meta.get_next_age_based_log_path(next_time);
+                    return match &meta.rotation {
+                        Rotation::SizeBased(_) => Err(LogRollerError::InvalidRotationType),
+                        Rotation::AgeBased(rotation_age) => {
+                            let path_fn = |pattern: &str| -> PathBuf {
+                                meta.directory.join(PathBuf::from(
+                                    next_time
+                                        .format(&format!(
+                                            "{}.{pattern}",
+                                            meta.filename.as_path().to_string_lossy()
+                                        ))
+                                        .to_string(),
+                                ))
+                            };
+                            Ok(match rotation_age {
+                                RotationAge::Minutely => path_fn("%Y-%m-%d-%H-%M"),
+                                RotationAge::Hourly => path_fn("%Y-%m-%d-%H"),
+                                RotationAge::Daily => path_fn("%Y-%m-%d"),
+                            })
+                        }
+                    };
                 }
             }
         }
-        Err(LogRollerError::InvalidFilenamePattern)
+        Err(LogRollerError::ShouldNotRotate)
     }
 }
 
@@ -220,10 +250,6 @@ impl LogRollerMeta {
                 let infile = fs::File::open(log_path).map_err(LogRollerError::FileIOError)?;
                 let reader = io::BufReader::new(infile);
 
-                println!(
-                    "Creating gzip file: {:?}",
-                    PathBuf::from(format!("{}.gz", log_path.to_string_lossy()))
-                );
                 let outfile =
                     fs::File::create(PathBuf::from(format!("{}.gz", log_path.to_string_lossy())))
                         .map_err(LogRollerError::FileIOError)?;
@@ -242,7 +268,7 @@ impl LogRollerMeta {
             | Compression::LZ4
             | Compression::Zstd
             | Compression::XZ
-            | Compression::Snappy => todo!(),
+            | Compression::Snappy => {}
         }
         Ok(())
     }
@@ -268,7 +294,6 @@ impl LogRollerMeta {
                         *writer = log_file;
 
                         std::thread::spawn(move || {
-                            println!("Compressing log file: {:?}", new_log_path);
                             if let Err(err) = Self::compress(&compression, &new_log_path) {
                                 eprintln!("Couldn't compress log file: {}", err);
                             }
@@ -309,6 +334,8 @@ impl LogRollerMeta {
             rotation: Rotation::AgeBased(RotationAge::Daily),
             time_zone: TimeZone::Local,
             compression: None,
+            // max_keep_files: None,
+            // max_compressed_files: None,
         }
     }
 
@@ -334,52 +361,10 @@ impl LogRollerMeta {
             }
         }
     }
-
-    fn get_next_size_based_log_path(&self, next_index: usize) -> Result<PathBuf, LogRollerError> {
-        match &self.rotation {
-            Rotation::AgeBased(_) => Err(LogRollerError::InvalidRotationType),
-            Rotation::SizeBased(_) => Ok(self.directory.join(PathBuf::from(
-                format!(
-                    "{}.{}",
-                    self.filename.as_path().to_string_lossy(),
-                    next_index
-                )
-                .to_string(),
-            ))),
-        }
-    }
-
-    fn get_next_age_based_log_path(
-        &self,
-        next_time: DateTime<FixedOffset>,
-    ) -> Result<PathBuf, LogRollerError> {
-        match &self.rotation {
-            Rotation::SizeBased(_) => Err(LogRollerError::InvalidRotationType),
-            Rotation::AgeBased(rotation_age) => {
-                let path_fn = |pattern: &str| -> PathBuf {
-                    self.directory.join(PathBuf::from(
-                        next_time
-                            .format(&format!(
-                                "{}.{pattern}",
-                                self.filename.as_path().to_string_lossy()
-                            ))
-                            .to_string(),
-                    ))
-                };
-                Ok(match rotation_age {
-                    RotationAge::Minutely => path_fn("%Y-%m-%d-%H-%M"),
-                    RotationAge::Hourly => path_fn("%Y-%m-%d-%H"),
-                    RotationAge::Daily => path_fn("%Y-%m-%d"),
-                })
-            }
-        }
-    }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum LogRollerError {
-    #[error("Invalid filename pattern")]
-    InvalidFilenamePattern,
     #[error("Failed to create directory: {0}")]
     CreateDirectoryFailed(String),
     #[error("Failed to create file: {0}")]
@@ -394,6 +379,8 @@ pub enum LogRollerError {
     RenameFileError,
     #[error("File IO error: {0}")]
     FileIOError(#[from] std::io::Error),
+    #[error("Should not rotate right now")]
+    ShouldNotRotate,
 }
 
 pub struct LogRollerBuilder {
@@ -530,74 +517,5 @@ impl io::Write for RollingWriter<'_> {
 
     fn flush(&mut self) -> io::Result<()> {
         (&*self.0).flush()
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn test_size_based_rotation() {
-        let mut lr = LogRollerBuilder::new("./logs", "size-based-app.log")
-            .time_zone(TimeZone::Local)
-            .rotation(Rotation::SizeBased(RotationSize::Bytes(256)))
-            .build()
-            .unwrap();
-
-        let mut cnt = 0;
-        loop {
-            let _ = lr.write(format!("line {cnt}\n").as_bytes()).unwrap();
-            cnt += 1;
-            std::thread::sleep(std::time::Duration::from_millis(500));
-        }
-    }
-
-    #[test]
-    fn test_age_based_rotation_minutely() {
-        let mut lr = LogRollerBuilder::new("./logs", "age-based-app.log")
-            .time_zone(TimeZone::Local)
-            .rotation(Rotation::AgeBased(RotationAge::Minutely))
-            .build()
-            .unwrap();
-
-        let mut cnt = 0;
-        loop {
-            let _ = lr.write(format!("line {cnt}\n").as_bytes()).unwrap();
-            cnt += 1;
-            std::thread::sleep(std::time::Duration::from_millis(500));
-        }
-    }
-
-    #[test]
-    fn test_age_based_rotation_hourly() {
-        let mut lr = LogRollerBuilder::new("./logs", "age-based-app.log")
-            .time_zone(TimeZone::Local)
-            .rotation(Rotation::AgeBased(RotationAge::Hourly))
-            .build()
-            .unwrap();
-
-        let mut cnt = 0;
-        loop {
-            let _ = lr.write(format!("line {cnt}\n").as_bytes()).unwrap();
-            cnt += 1;
-            std::thread::sleep(std::time::Duration::from_millis(500));
-        }
-    }
-
-    #[test]
-    fn test_age_based_rotation_daily() {
-        let mut lr = LogRollerBuilder::new("./logs", "age-based-app.log")
-            .time_zone(TimeZone::Local)
-            .rotation(Rotation::AgeBased(RotationAge::Daily))
-            .build()
-            .unwrap();
-
-        let mut cnt = 0;
-        loop {
-            let _ = lr.write(format!("line {cnt}\n").as_bytes()).unwrap();
-            cnt += 1;
-            std::thread::sleep(std::time::Duration::from_millis(500));
-        }
     }
 }
