@@ -1,10 +1,11 @@
-use logroller::{Compression, LogRollerBuilder, Rotation, RotationAge};
+use logroller::{Compression, LogRollerBuilder, Rotation, RotationAge, TimeZone};
 use tracing_subscriber::util::SubscriberInitExt;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let appender = LogRollerBuilder::new("./logs", "tracing.log")
         .rotation(Rotation::AgeBased(RotationAge::Minutely))
         .max_keep_files(3)
+        .time_zone(TimeZone::Local)
         .compression(Compression::Gzip)
         .build()?;
     let (non_blocking, _guard) = tracing_appender::non_blocking(appender);

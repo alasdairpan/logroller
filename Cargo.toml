@@ -3,17 +3,21 @@ name = "logroller"
 version = "0.1.0"
 edition = "2021"
 
+[workspace.dependencies]
+tracing-subscriber = { version = "0.3" }
+
 [dependencies]
 chrono = "0.4"
 thiserror = "1.0"
 flate2 = "1.0"
 regex = "1"
-tracing-subscriber = { version = "0.3", optional = true }
+tracing-subscriber = { workspace = true, optional = true }
 
 [dev-dependencies]
 tracing = "0.1"
 tracing-appender = "0.2"
+tracing-subscriber = { workspace = true }
 
 [features]
-default = ["tracing"]
+default = []
 tracing = ["dep:tracing-subscriber"]

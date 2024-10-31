@@ -6,7 +6,7 @@ use std::{
     fs::{self, DirEntry},
     io::{self, Write as _},
     path::{Path, PathBuf},
-    sync::{PoisonError, RwLock, RwLockReadGuard},
+    sync::{PoisonError, RwLock},
     time::SystemTime,
 };
 
@@ -34,11 +34,11 @@ impl RotationSize {
 #[derive(Debug, Clone)]
 pub enum Compression {
     Gzip,
-    Bzip2,
-    LZ4,
-    Zstd,
-    XZ,
-    Snappy,
+    // Bzip2,
+    // LZ4,
+    // Zstd,
+    // XZ,
+    // Snappy,
 }
 
 /// The time zone for the log files.
@@ -383,11 +383,11 @@ impl LogRollerMeta {
 
                 fs::remove_file(log_path).map_err(LogRollerError::FileIOError)?;
             }
-            Compression::Bzip2
-            | Compression::LZ4
-            | Compression::Zstd
-            | Compression::XZ
-            | Compression::Snappy => {}
+            // Compression::Bzip2
+            // | Compression::LZ4
+            // | Compression::Zstd
+            // | Compression::XZ
+            // | Compression::Snappy => {}
         }
         Ok(())
     }
@@ -715,7 +715,7 @@ impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for LogRoller {
 }
 
 #[cfg(feature = "tracing")]
-pub struct RollingWriter<'a>(RwLockReadGuard<'a, fs::File>);
+pub struct RollingWriter<'a>(std::sync::RwLockReadGuard<'a, fs::File>);
 #[cfg(feature = "tracing")]
 impl io::Write for RollingWriter<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
