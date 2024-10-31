@@ -479,14 +479,17 @@ impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for LogRoller {
     fn make_writer(&'a self) -> Self::Writer {
         let old_log_path = self.state.curr_file_path.to_owned();
         if let Some(new_log_path) = Self::should_rollover(&self.meta, &self.state) {
-            let _ = self
+            if let Err(refresh_writer_err) = self
                 .meta
                 .refresh_writer(
                     &mut self.writer.write().unwrap_or_else(PoisonError::into_inner),
                     old_log_path,
                     new_log_path.to_owned(),
                 )
-                .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()));
+                .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))
+            {
+                eprintln!("Couldn't refresh writer: {refresh_writer_err:?}");
+            }
         }
         RollingWriter(self.writer.read().unwrap_or_else(PoisonError::into_inner))
     }
