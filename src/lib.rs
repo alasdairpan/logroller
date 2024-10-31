@@ -10,6 +10,7 @@ use std::{
     time::SystemTime,
 };
 
+/// The size of the log file before it is rotated.
 #[derive(Debug, Clone)]
 pub enum RotationSize {
     Bytes(u64),
@@ -29,6 +30,7 @@ impl RotationSize {
     }
 }
 
+/// The type of compression to use for the log files.
 #[derive(Debug, Clone)]
 pub enum Compression {
     Gzip,
@@ -39,6 +41,9 @@ pub enum Compression {
     Snappy,
 }
 
+/// The time zone for the log files.
+/// The time zone can be set to UTC, local, or a fixed offset.
+/// If a fixed offset is used, the offset should be provided.
 #[derive(Debug, Clone)]
 pub enum TimeZone {
     UTC,
@@ -46,38 +51,69 @@ pub enum TimeZone {
     Fix(FixedOffset),
 }
 
-#[derive(Clone, Debug)]
+/// The age of the log file before it is rotated.
+#[derive(Debug, Clone)]
 pub enum RotationAge {
     Minutely,
     Hourly,
     Daily,
 }
 
-#[derive(Clone)]
+/// The rotation type for the log files.
+#[derive(Debug, Clone)]
 pub enum Rotation {
+    /// Rotate the log files based on size.
     SizeBased(RotationSize),
+    /// Rotate the log files based on age.
     AgeBased(RotationAge),
 }
 
+/// Metadata for the log roller.
+/// This struct is used to configure the log roller.
 #[derive(Clone)]
 struct LogRollerMeta {
+    /// The directory where the log files are stored.
     directory: PathBuf,
+    /// The name of the log file.
     filename: PathBuf,
+    /// The rotation type for the log files.
     rotation: Rotation,
+    /// The time zone for the log files.
     time_zone: TimeZone,
+    /// The compression type for the log files.
     compression: Option<Compression>,
+    /// The maximum number of log files to keep.
     max_keep_files: Option<u64>,
 }
 
+/// State for the log roller.
+/// This struct is used to keep track of the current state of the log roller.
 struct LogRollerState {
+    /// The next index for size-based rotation.
     next_size_based_index: usize,
+    /// The next time for age-based rotation.
     next_age_based_time: DateTime<FixedOffset>,
-
+    /// The current file path.
     curr_file_path: PathBuf,
+    /// The current file size in bytes.
     curr_file_size_bytes: u64,
 }
 
 impl LogRollerState {
+    /// Get the next size-based index for the log file.
+    /// This function will scan the directory for existing log files with the same name
+    /// and return the next index based on the existing files.
+    /// If no existing files are found, the index will be set to 1.
+    /// The index is used to create a new log file with the same name but a different index.
+    /// For example, if the log file is `app.log`, the next log file will be `app.log.1`.
+    /// If the log file is `app.log.1`, the next log file will be `app.log.2`, and so on.
+    /// The index is incremented each time a new log file is created.
+    /// The index is reset to 1 when the log file is rotated.
+    /// # Arguments
+    /// * `directory` - The directory where the log files are stored.
+    /// * `filename` - The name of the log file.
+    /// # Returns
+    /// The next size-based index for the log file.
     fn get_next_size_based_index(directory: &PathBuf, filename: &Path) -> usize {
         let mut max_suffix = 0;
         if directory.is_dir() {
@@ -100,11 +136,19 @@ impl LogRollerState {
         max_suffix + 1
     }
 
+    /// Get the current size of the log file.
+    /// This function will return the size of the log file in bytes.
+    /// If the log file does not exist, the size will be set to 0.
+    /// # Arguments
+    /// * `log_path` - The path to the log file.
+    /// # Returns
+    /// The size of the log file in bytes.
     fn get_curr_size_based_file_size(log_path: &Path) -> u64 {
         std::fs::metadata(log_path).map_or(0, |m| m.len())
     }
 }
 
+/// A log roller that rolls over logs based on size or age.
 pub struct LogRoller {
     meta: LogRollerMeta,
     state: LogRollerState,
@@ -112,6 +156,15 @@ pub struct LogRoller {
 }
 
 impl LogRoller {
+    /// Check if the log file should be rolled over.
+    /// This function will check if the log file should be rolled over based on the rotation type.
+    /// If the log file should be rolled over, the function will return the path to the new log file.
+    /// If the log file should not be rolled over, the function will return None.
+    /// # Arguments
+    /// * `meta` - The metadata for the log roller.
+    /// * `state` - The state for the log roller.
+    /// # Returns
+    /// The path to the new log file if the log file should be rolled over, otherwise None.
     fn should_rollover(meta: &LogRollerMeta, state: &LogRollerState) -> Option<PathBuf> {
         match &meta.rotation {
             Rotation::SizeBased(rotation_size) => {
@@ -141,6 +194,7 @@ impl LogRoller {
 }
 
 impl LogRollerMeta {
+    /// Get the current time in the specified time zone.
     fn now(&self) -> DateTime<FixedOffset> {
         let tz = match &self.time_zone {
             TimeZone::UTC => Utc::now().fixed_offset().offset().to_owned(),
@@ -150,6 +204,12 @@ impl LogRollerMeta {
         Local::now().with_timezone(&tz)
     }
 
+    /// Replace the time in the datetime with the specified time.
+    /// # Arguments
+    /// * `base_datetime` - The base datetime.
+    /// * `time_to_replaced` - The time to be replaced.
+    /// # Returns
+    /// The datetime with the time replaced.
     #[allow(deprecated)]
     fn replace_time(
         &self,
@@ -162,6 +222,13 @@ impl LogRollerMeta {
         )
     }
 
+    /// Get the next time for the log file rotation.
+    /// This function will return the next time for the log file rotation based on the rotation age.
+    /// # Arguments
+    /// * `base_datetime` - The base datetime.
+    /// * `rotation_age` - The rotation age.
+    /// # Returns
+    /// The next time for the log file rotation.
     fn next_time(
         &self,
         base_datetime: DateTime<FixedOffset>,
@@ -194,12 +261,22 @@ impl LogRollerMeta {
         }
     }
 
+    /// Create a new log file.
+    /// This function will create a new log file at the specified path.
+    /// If the log file already exists, the function will append to the existing log file.
+    /// If the log file does not exist, the function will create a new log file.
+    /// If the directory does not exist, the function will create the directory.
+    /// # Arguments
+    /// * `log_path` - The path to the log file.
+    /// # Returns
+    /// The log file.
     fn create_log_file(&self, log_path: &Path) -> Result<fs::File, LogRollerError> {
         let mut open_options = fs::OpenOptions::new();
         open_options.append(true).create(true);
 
         let mut create_log_file_res = open_options.open(log_path);
         if create_log_file_res.is_err() {
+            // Create the directory if it doesn't exist
             if let Some(parent) = log_path.parent() {
                 fs::create_dir_all(parent)
                     .map_err(|err| LogRollerError::CreateDirectoryFailed(err.to_string()))?;
@@ -212,6 +289,7 @@ impl LogRollerMeta {
         Ok(log_file)
     }
 
+    /// Process old log files.
     fn process_old_logs(meta: &LogRollerMeta, log_path: &PathBuf) -> Result<(), LogRollerError> {
         Self::compress(&meta.compression, log_path)?;
         let all_log_files = Self::list_all_files(
@@ -368,6 +446,16 @@ impl LogRollerMeta {
 }
 
 impl LogRollerMeta {
+    /// Create a new log roller metadata.
+    /// # Arguments
+    /// * `directory` - The directory where the log files are stored.
+    /// * `filename` - The name of the log file.
+    /// # Returns
+    /// The log roller metadata.
+    /// The rotation type is set to age-based with daily rotation by default.
+    /// The time zone is set to local by default.
+    /// The compression type is set to None by default.
+    /// The maximum number of log files to keep is set to None by default.
     fn new<P: AsRef<Path>>(directory: P, filename: P) -> Self {
         LogRollerMeta {
             directory: directory.as_ref().to_path_buf(),
@@ -379,6 +467,7 @@ impl LogRollerMeta {
         }
     }
 
+    /// Get the next log file path based on the rotation age.
     fn get_next_age_based_log_path(
         &self,
         rotation_age: &RotationAge,
@@ -401,6 +490,7 @@ impl LogRollerMeta {
         }
     }
 
+    /// Get the current log file path.
     fn get_curr_log_path(&self) -> PathBuf {
         match &self.rotation {
             Rotation::SizeBased(_) => self.directory.join(self.filename.as_path()),
@@ -433,17 +523,41 @@ pub enum LogRollerError {
     InternalError(String),
 }
 
+/// Builder for the log roller.
 pub struct LogRollerBuilder {
     meta: LogRollerMeta,
 }
 
+/// Builder for the log roller.
+/// This struct is used to build the log roller with the desired configuration.
+/// The log roller can be configured with the following options:
+/// * Time zone
+/// * Rotation type
+/// * Compression type
+/// * Maximum number of log files to keep
+/// The log roller can be built with the `build` method.
+/// # Example
+/// ```
+/// use logroller::{Compression, LogRollerBuilder, Rotation, RotationAge};
+/// let appender = LogRollerBuilder::new("./logs", "app.log")
+///     .rotation(Rotation::AgeBased(RotationAge::Minutely))
+///     .max_keep_files(3)
+///     .compression(Compression::Gzip)
+///     .build()
+///     .unwrap();
+/// ```
 impl LogRollerBuilder {
+    /// Create a new log roller builder.
+    /// # Arguments
+    /// * `directory` - The directory where the log files are stored.
+    /// * `filename` - The name of the log file.
     pub fn new<P: AsRef<Path>>(directory: P, filename: P) -> Self {
         LogRollerBuilder {
             meta: LogRollerMeta::new(directory, filename),
         }
     }
 
+    /// Set the time zone for the log files.
     pub fn time_zone(self, time_zone: TimeZone) -> Self {
         Self {
             meta: LogRollerMeta {
@@ -453,6 +567,7 @@ impl LogRollerBuilder {
         }
     }
 
+    /// Set the rotation type for the log files.
     pub fn rotation(self, rotation: Rotation) -> Self {
         Self {
             meta: LogRollerMeta {
@@ -462,6 +577,7 @@ impl LogRollerBuilder {
         }
     }
 
+    /// Set the compression type for the log files.
     pub fn compression(self, compression: Compression) -> Self {
         Self {
             meta: LogRollerMeta {
@@ -471,6 +587,7 @@ impl LogRollerBuilder {
         }
     }
 
+    /// Set the maximum number of log files to keep.
     pub fn max_keep_files(self, max_keep_files: u64) -> Self {
         Self {
             meta: LogRollerMeta {
@@ -480,6 +597,7 @@ impl LogRollerBuilder {
         }
     }
 
+    /// Build the log roller.
     pub fn build(self) -> Result<LogRoller, LogRollerError> {
         let curr_file_path = self.meta.get_curr_log_path();
         Ok(LogRoller {
@@ -546,6 +664,33 @@ impl io::Write for LogRoller {
     }
 }
 
+/// Implement the `MakeWriter` trait for the log roller.
+/// This trait is used by the `tracing_subscriber` to create a new writer for the log roller.
+/// The `MakeWriter` trait is used to create a new writer for the log roller.
+/// The `Writer` type is set to `RollingWriter`.
+/// The `make_writer` method is used to create a new writer for the log roller.
+/// # Example
+/// ```
+/// use logroller::{Compression, LogRollerBuilder, Rotation, RotationAge};
+/// use tracing_subscriber::util::SubscriberInitExt;
+///
+/// let appender = LogRollerBuilder::new("./logs", "tracing.log")
+///     .rotation(Rotation::AgeBased(RotationAge::Minutely))
+///     .max_keep_files(3)
+///     .compression(Compression::Gzip)
+///     .build()
+///     .unwrap();
+/// let (non_blocking, _guard) = tracing_appender::non_blocking(appender);
+/// tracing_subscriber::fmt()
+///     .with_writer(non_blocking)
+///     .with_ansi(false)
+///     .with_target(false)
+///     .with_file(true)
+///     .with_line_number(true)
+///     .finish()
+///     .try_init()
+///     .unwrap();
+/// ```
 #[cfg(feature = "tracing")]
 impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for LogRoller {
     type Writer = RollingWriter<'a>;
