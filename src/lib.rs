@@ -1,13 +1,61 @@
-use chrono::{DateTime, FixedOffset, Local, NaiveTime, Timelike, Utc};
-use flate2::write::GzEncoder;
-use regex::Regex;
-use std::{
-    fmt::Debug,
-    fs::{self, DirEntry},
-    io::{self, Write as _},
-    path::{Path, PathBuf},
-    sync::{PoisonError, RwLock},
-    time::SystemTime,
+//! # LogRoller
+//!
+//! LogRoller is a library for rolling over log files based on size or age. It
+//! supports various rotation strategies, time zones, and compression methods.
+//! **LogRoller integrates seamlessly as an appender for the tracing crate,
+//! offering flexible log rotation with time zone support**. Log rotation can be
+//! configured for either a fixed time zone or the local system time zone,
+//! ensuring logs align consistently with specific regional or user-defined time
+//! standards. This feature is particularly useful for applications that require
+//! organized logs by time, regardless of server location or daylight saving
+//! changes. LogRoller enables precise control over logging schedules, enhancing
+//! clarity and organization in log management across various time zones.
+//!
+//!
+//! ## Example
+//!
+//! ```rust
+//! use {
+//!    logroller::{Compression, LogRollerBuilder, Rotation, RotationAge, TimeZone},
+//!    tracing_subscriber::util::SubscriberInitExt,
+//! };
+//!
+//! fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!    let appender = LogRollerBuilder::new("./logs", "tracing.log")
+//!        .rotation(Rotation::AgeBased(RotationAge::Minutely))
+//!        .max_keep_files(3)
+//!        .time_zone(TimeZone::Local) // Use system local time zone when rotating files
+//!        .compression(Compression::Gzip) // Compress rotated files with Gzip
+//!        .build()?;
+//!    let (non_blocking, _guard) = tracing_appender::non_blocking(appender);
+//!    tracing_subscriber::fmt()
+//!        .with_writer(non_blocking)
+//!        .with_ansi(false)
+//!        .with_target(false)
+//!        .with_file(true)
+//!        .with_line_number(true)
+//!        .finish()
+//!        .try_init()?;
+//!
+//!    tracing::info!("This is an info message");
+//!    tracing::warn!("This is a warning message");
+//!    tracing::error!("This is an error message");
+//!
+//!    Ok(())
+//! }
+//! ```
+use {
+    chrono::{DateTime, FixedOffset, Local, NaiveTime, Timelike, Utc},
+    flate2::write::GzEncoder,
+    regex::Regex,
+    std::{
+        fmt::Debug,
+        fs::{self, DirEntry},
+        io::{self, Write as _},
+        path::{Path, PathBuf},
+        sync::{PoisonError, RwLock},
+        time::SystemTime,
+    },
 };
 
 /// The size of the log file before it is rotated.
@@ -20,6 +68,7 @@ pub enum RotationSize {
 }
 
 impl RotationSize {
+    /// Get the size of the log file in bytes.
     fn bytes(&self) -> u64 {
         match self {
             RotationSize::Bytes(b) => *b,
@@ -101,15 +150,15 @@ struct LogRollerState {
 
 impl LogRollerState {
     /// Get the next size-based index for the log file.
-    /// This function will scan the directory for existing log files with the same name
-    /// and return the next index based on the existing files.
+    /// This function will scan the directory for existing log files with the
+    /// same name and return the next index based on the existing files.
     /// If no existing files are found, the index will be set to 1.
-    /// The index is used to create a new log file with the same name but a different index.
-    /// For example, if the log file is `app.log`, the next log file will be `app.log.1`.
-    /// If the log file is `app.log.1`, the next log file will be `app.log.2`, and so on.
-    /// The index is incremented each time a new log file is created.
-    /// The index is reset to 1 when the log file is rotated.
-    /// # Arguments
+    /// The index is used to create a new log file with the same name but a
+    /// different index. For example, if the log file is `app.log`, the next
+    /// log file will be `app.log.1`. If the log file is `app.log.1`, the
+    /// next log file will be `app.log.2`, and so on. The index is
+    /// incremented each time a new log file is created. The index is reset
+    /// to 1 when the log file is rotated. # Arguments
     /// * `directory` - The directory where the log files are stored.
     /// * `filename` - The name of the log file.
     /// # Returns
@@ -143,9 +192,7 @@ impl LogRollerState {
     /// * `log_path` - The path to the log file.
     /// # Returns
     /// The size of the log file in bytes.
-    fn get_curr_size_based_file_size(log_path: &Path) -> u64 {
-        std::fs::metadata(log_path).map_or(0, |m| m.len())
-    }
+    fn get_curr_size_based_file_size(log_path: &Path) -> u64 { std::fs::metadata(log_path).map_or(0, |m| m.len()) }
 }
 
 /// A log roller that rolls over logs based on size or age.
@@ -157,14 +204,15 @@ pub struct LogRoller {
 
 impl LogRoller {
     /// Check if the log file should be rolled over.
-    /// This function will check if the log file should be rolled over based on the rotation type.
-    /// If the log file should be rolled over, the function will return the path to the new log file.
-    /// If the log file should not be rolled over, the function will return None.
-    /// # Arguments
+    /// This function will check if the log file should be rolled over based on
+    /// the rotation type. If the log file should be rolled over, the
+    /// function will return the path to the new log file. If the log file
+    /// should not be rolled over, the function will return None. # Arguments
     /// * `meta` - The metadata for the log roller.
     /// * `state` - The state for the log roller.
     /// # Returns
-    /// The path to the new log file if the log file should be rolled over, otherwise None.
+    /// The path to the new log file if the log file should be rolled over,
+    /// otherwise None.
     fn should_rollover(meta: &LogRollerMeta, state: &LogRollerState) -> Option<PathBuf> {
         match &meta.rotation {
             Rotation::SizeBased(rotation_size) => {
@@ -211,11 +259,7 @@ impl LogRollerMeta {
     /// # Returns
     /// The datetime with the time replaced.
     #[allow(deprecated)]
-    fn replace_time(
-        &self,
-        base_datetime: DateTime<FixedOffset>,
-        time_to_replaced: NaiveTime,
-    ) -> DateTime<FixedOffset> {
+    fn replace_time(&self, base_datetime: DateTime<FixedOffset>, time_to_replaced: NaiveTime) -> DateTime<FixedOffset> {
         DateTime::<FixedOffset>::from_local(
             base_datetime.date_naive().and_time(time_to_replaced),
             *base_datetime.offset(),
@@ -223,8 +267,8 @@ impl LogRollerMeta {
     }
 
     /// Get the next time for the log file rotation.
-    /// This function will return the next time for the log file rotation based on the rotation age.
-    /// # Arguments
+    /// This function will return the next time for the log file rotation based
+    /// on the rotation age. # Arguments
     /// * `base_datetime` - The base datetime.
     /// * `rotation_age` - The rotation age.
     /// # Returns
@@ -239,16 +283,14 @@ impl LogRollerMeta {
                 let d = base_datetime + chrono::Duration::minutes(1);
                 Ok(self.replace_time(
                     d,
-                    NaiveTime::from_hms_opt(d.hour(), d.minute(), 0)
-                        .ok_or(LogRollerError::GetNaiveTimeFailed)?,
+                    NaiveTime::from_hms_opt(d.hour(), d.minute(), 0).ok_or(LogRollerError::GetNaiveTimeFailed)?,
                 ))
             }
             RotationAge::Hourly => {
                 let d = base_datetime + chrono::Duration::hours(1);
                 Ok(self.replace_time(
                     d,
-                    NaiveTime::from_hms_opt(d.hour(), 0, 0)
-                        .ok_or(LogRollerError::GetNaiveTimeFailed)?,
+                    NaiveTime::from_hms_opt(d.hour(), 0, 0).ok_or(LogRollerError::GetNaiveTimeFailed)?,
                 ))
             }
             RotationAge::Daily => {
@@ -263,10 +305,10 @@ impl LogRollerMeta {
 
     /// Create a new log file.
     /// This function will create a new log file at the specified path.
-    /// If the log file already exists, the function will append to the existing log file.
-    /// If the log file does not exist, the function will create a new log file.
-    /// If the directory does not exist, the function will create the directory.
-    /// # Arguments
+    /// If the log file already exists, the function will append to the existing
+    /// log file. If the log file does not exist, the function will create a
+    /// new log file. If the directory does not exist, the function will
+    /// create the directory. # Arguments
     /// * `log_path` - The path to the log file.
     /// # Returns
     /// The log file.
@@ -278,14 +320,12 @@ impl LogRollerMeta {
         if create_log_file_res.is_err() {
             // Create the directory if it doesn't exist
             if let Some(parent) = log_path.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|err| LogRollerError::CreateDirectoryFailed(err.to_string()))?;
+                fs::create_dir_all(parent).map_err(|err| LogRollerError::CreateDirectoryFailed(err.to_string()))?;
                 create_log_file_res = open_options.open(log_path);
             }
         }
 
-        let log_file =
-            create_log_file_res.map_err(|err| LogRollerError::CreateFileFailed(err.to_string()))?;
+        let log_file = create_log_file_res.map_err(|err| LogRollerError::CreateFileFailed(err.to_string()))?;
         Ok(log_file)
     }
 
@@ -294,20 +334,13 @@ impl LogRollerMeta {
         Self::compress(&meta.compression, log_path)?;
         let all_log_files = Self::list_all_files(
             &meta.directory,
-            meta.filename
-                .as_path()
-                .as_os_str()
-                .to_string_lossy()
-                .as_ref(),
+            meta.filename.as_path().as_os_str().to_string_lossy().as_ref(),
             &meta.rotation,
         )?;
 
         let max_keep_files = meta.max_keep_files.unwrap_or(u64::MAX);
         if all_log_files.len() > max_keep_files as usize {
-            for (_, file) in all_log_files
-                .iter()
-                .take(all_log_files.len() - max_keep_files as usize)
-            {
+            for (_, file) in all_log_files.iter().take(all_log_files.len() - max_keep_files as usize) {
                 if let Err(remove_log_file_err) = fs::remove_file(file.path()) {
                     eprintln!("Couldn't remove log file: {remove_log_file_err:?}");
                 }
@@ -336,8 +369,7 @@ impl LogRollerMeta {
             }
         };
 
-        let files = fs::read_dir(directory)
-            .map_err(|err| LogRollerError::InternalError(err.to_string()))?;
+        let files = fs::read_dir(directory).map_err(|err| LogRollerError::InternalError(err.to_string()))?;
 
         let mut all_log_files = Vec::new();
         for file in files.flatten() {
@@ -357,10 +389,7 @@ impl LogRollerMeta {
         Ok(all_log_files)
     }
 
-    fn compress(
-        compression: &Option<Compression>,
-        log_path: &PathBuf,
-    ) -> Result<(), LogRollerError> {
+    fn compress(compression: &Option<Compression>, log_path: &PathBuf) -> Result<(), LogRollerError> {
         let compression = match compression {
             Some(compression) => compression,
             None => {
@@ -372,9 +401,8 @@ impl LogRollerMeta {
                 let infile = fs::File::open(log_path).map_err(LogRollerError::FileIOError)?;
                 let reader = io::BufReader::new(infile);
 
-                let outfile =
-                    fs::File::create(PathBuf::from(format!("{}.gz", log_path.to_string_lossy())))
-                        .map_err(LogRollerError::FileIOError)?;
+                let outfile = fs::File::create(PathBuf::from(format!("{}.gz", log_path.to_string_lossy())))
+                    .map_err(LogRollerError::FileIOError)?;
                 let writer = io::BufWriter::new(outfile);
 
                 let mut encoder = GzEncoder::new(writer, flate2::Compression::default());
@@ -382,12 +410,11 @@ impl LogRollerMeta {
                 encoder.finish()?;
 
                 fs::remove_file(log_path).map_err(LogRollerError::FileIOError)?;
-            }
-            // Compression::Bzip2
-            // | Compression::LZ4
-            // | Compression::Zstd
-            // | Compression::XZ
-            // | Compression::Snappy => {}
+            } /* Compression::Bzip2
+               * | Compression::LZ4
+               * | Compression::Zstd
+               * | Compression::XZ
+               * | Compression::Snappy => {} */
         }
         Ok(())
     }
@@ -402,8 +429,7 @@ impl LogRollerMeta {
         match &self.rotation {
             Rotation::SizeBased(_) => {
                 let curr_log_path = self.directory.join(&self.filename);
-                std::fs::rename(&curr_log_path, &new_log_path)
-                    .map_err(|_| LogRollerError::RenameFileError)?;
+                std::fs::rename(&curr_log_path, &new_log_path).map_err(|_| LogRollerError::RenameFileError)?;
 
                 match self.create_log_file(&curr_log_path) {
                     Ok(log_file) => {
@@ -468,18 +494,11 @@ impl LogRollerMeta {
     }
 
     /// Get the next log file path based on the rotation age.
-    fn get_next_age_based_log_path(
-        &self,
-        rotation_age: &RotationAge,
-        datetime: &DateTime<FixedOffset>,
-    ) -> PathBuf {
+    fn get_next_age_based_log_path(&self, rotation_age: &RotationAge, datetime: &DateTime<FixedOffset>) -> PathBuf {
         let path_fn = |pattern: &str| -> PathBuf {
             self.directory.join(PathBuf::from(
                 datetime
-                    .format(&format!(
-                        "{}.{pattern}",
-                        self.filename.as_path().to_string_lossy()
-                    ))
+                    .format(&format!("{}.{pattern}", self.filename.as_path().to_string_lossy()))
                     .to_string(),
             ))
         };
@@ -494,13 +513,12 @@ impl LogRollerMeta {
     fn get_curr_log_path(&self) -> PathBuf {
         match &self.rotation {
             Rotation::SizeBased(_) => self.directory.join(self.filename.as_path()),
-            Rotation::AgeBased(rotation_age) => {
-                self.get_next_age_based_log_path(rotation_age, &self.now())
-            }
+            Rotation::AgeBased(rotation_age) => self.get_next_age_based_log_path(rotation_age, &self.now()),
         }
     }
 }
 
+/// Errors that can occur when using the log roller.
 #[derive(Debug, thiserror::Error)]
 pub enum LogRollerError {
     #[error("Failed to create directory: {0}")]
@@ -560,20 +578,14 @@ impl LogRollerBuilder {
     /// Set the time zone for the log files.
     pub fn time_zone(self, time_zone: TimeZone) -> Self {
         Self {
-            meta: LogRollerMeta {
-                time_zone,
-                ..self.meta
-            },
+            meta: LogRollerMeta { time_zone, ..self.meta },
         }
     }
 
     /// Set the rotation type for the log files.
     pub fn rotation(self, rotation: Rotation) -> Self {
         Self {
-            meta: LogRollerMeta {
-                rotation,
-                ..self.meta
-            },
+            meta: LogRollerMeta { rotation, ..self.meta },
         }
     }
 
@@ -626,10 +638,7 @@ impl LogRollerBuilder {
 
 impl io::Write for LogRoller {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let writer = self
-            .writer
-            .get_mut()
-            .unwrap_or_else(PoisonError::into_inner);
+        let writer = self.writer.get_mut().unwrap_or_else(PoisonError::into_inner);
 
         let old_log_path = self.state.curr_file_path.to_owned();
         if let Some(new_log_path) = Self::should_rollover(&self.meta, &self.state) {
@@ -656,18 +665,13 @@ impl io::Write for LogRoller {
         writer.write(buf)
     }
 
-    fn flush(&mut self) -> io::Result<()> {
-        self.writer
-            .get_mut()
-            .unwrap_or_else(PoisonError::into_inner)
-            .flush()
-    }
+    fn flush(&mut self) -> io::Result<()> { self.writer.get_mut().unwrap_or_else(PoisonError::into_inner).flush() }
 }
 
 /// Implement the `MakeWriter` trait for the log roller.
-/// This trait is used by the `tracing_subscriber` to create a new writer for the log roller.
-/// The `MakeWriter` trait is used to create a new writer for the log roller.
-/// The `Writer` type is set to `RollingWriter`.
+/// This trait is used by the `tracing_subscriber` to create a new writer for
+/// the log roller. The `MakeWriter` trait is used to create a new writer for
+/// the log roller. The `Writer` type is set to `RollingWriter`.
 /// The `make_writer` method is used to create a new writer for the log roller.
 /// # Example
 /// ```
@@ -718,11 +722,7 @@ impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for LogRoller {
 pub struct RollingWriter<'a>(std::sync::RwLockReadGuard<'a, fs::File>);
 #[cfg(feature = "tracing")]
 impl io::Write for RollingWriter<'_> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        (&*self.0).write(buf)
-    }
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> { (&*self.0).write(buf) }
 
-    fn flush(&mut self) -> io::Result<()> {
-        (&*self.0).flush()
-    }
+    fn flush(&mut self) -> io::Result<()> { (&*self.0).flush() }
 }

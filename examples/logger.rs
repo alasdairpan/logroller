@@ -1,5 +1,7 @@
-use logroller::{LogRollerBuilder, Rotation, RotationSize};
-use std::io::Write;
+use {
+    logroller::{LogRollerBuilder, Rotation, RotationSize},
+    std::io::Write,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut logger = LogRollerBuilder::new("./logs", "logger.log")

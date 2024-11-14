@@ -1,0 +1,10 @@
+# Ref: https://rust-lang.github.io/rustfmt/?version=master
+max_width = 120
+fn_single_line = true
+imports_granularity = "One"
+normalize_comments = true
+normalize_doc_attributes = true
+reorder_impl_items = true
+spaces_around_ranges = true
+use_field_init_shorthand = true
+wrap_comments = true

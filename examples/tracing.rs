@@ -1,12 +1,14 @@
-use logroller::{Compression, LogRollerBuilder, Rotation, RotationAge, TimeZone};
-use tracing_subscriber::util::SubscriberInitExt;
+use {
+    logroller::{Compression, LogRollerBuilder, Rotation, RotationAge, TimeZone},
+    tracing_subscriber::util::SubscriberInitExt,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let appender = LogRollerBuilder::new("./logs", "tracing.log")
         .rotation(Rotation::AgeBased(RotationAge::Minutely))
         .max_keep_files(3)
-        .time_zone(TimeZone::Local)
-        .compression(Compression::Gzip)
+        .time_zone(TimeZone::Local) // Use system local time zone when rotating files
+        .compression(Compression::Gzip) // Compress rotated files with Gzip
         .build()?;
     let (non_blocking, _guard) = tracing_appender::non_blocking(appender);
     tracing_subscriber::fmt()
