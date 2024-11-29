@@ -1,13 +1,13 @@
 [package]
 name = "logroller"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 authors = ["Trayvon Pan <trayvonpan@gmail.com>"]
 categories = ["development-tools::debugging"]
 description = "A Rust library for automatic file rotation, working with the `tracing-appender` crate."
 documentation = "https://docs.rs/logroller/"
 keywords = ["logging", "tracing", "tracing-appender"]
-license = "GPL-3.0"
+license = "MIT"
 repository = "https://github.com/trayvonpan/logroller/"
 readme = "README.md"
 
