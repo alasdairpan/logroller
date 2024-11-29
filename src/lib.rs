@@ -128,7 +128,7 @@ struct LogRollerMeta {
     /// The rotation type for the log files.
     rotation: Rotation,
     /// The time zone for the log files.
-    time_zone: TimeZone,
+    time_zone: FixedOffset,
     /// The compression type for the log files.
     compression: Option<Compression>,
     /// The maximum number of log files to keep.
@@ -243,14 +243,7 @@ impl LogRoller {
 
 impl LogRollerMeta {
     /// Get the current time in the specified time zone.
-    fn now(&self) -> DateTime<FixedOffset> {
-        let tz = match &self.time_zone {
-            TimeZone::UTC => Utc::now().fixed_offset().offset().to_owned(),
-            TimeZone::Local => Local::now().offset().to_owned(),
-            TimeZone::Fix(offset) => offset.to_owned(),
-        };
-        Local::now().with_timezone(&tz)
-    }
+    fn now(&self) -> DateTime<FixedOffset> { Utc::now().with_timezone(&self.time_zone) }
 
     /// Replace the time in the datetime with the specified time.
     /// # Arguments
@@ -487,9 +480,9 @@ impl LogRollerMeta {
             directory: directory.as_ref().to_path_buf(),
             filename: filename.as_ref().to_path_buf(),
             rotation: Rotation::AgeBased(RotationAge::Daily),
-            time_zone: TimeZone::Local,
             compression: None,
             max_keep_files: None,
+            time_zone: Local::now().offset().to_owned(),
         }
     }
 
@@ -578,7 +571,14 @@ impl LogRollerBuilder {
     /// Set the time zone for the log files.
     pub fn time_zone(self, time_zone: TimeZone) -> Self {
         Self {
-            meta: LogRollerMeta { time_zone, ..self.meta },
+            meta: LogRollerMeta {
+                time_zone: match time_zone {
+                    TimeZone::UTC => Utc::now().fixed_offset().offset().to_owned(),
+                    TimeZone::Local => Local::now().offset().to_owned(),
+                    TimeZone::Fix(fixed_offset) => fixed_offset,
+                },
+                ..self.meta
+            },
         }
     }
 
