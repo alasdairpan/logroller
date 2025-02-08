@@ -551,6 +551,7 @@ pub struct LogRollerBuilder {
 /// * Rotation type
 /// * Compression type
 /// * Maximum number of log files to keep
+/// 
 /// The log roller can be built with the `build` method.
 /// # Example
 /// ```
