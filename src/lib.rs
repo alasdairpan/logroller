@@ -133,7 +133,7 @@ struct LogRollerMeta {
     compression: Option<Compression>,
     /// The maximum number of log files to keep.
     max_keep_files: Option<u64>,
-    /// file name suffix
+    /// File name suffix (Only for age-based rotation)
     suffix: Option<String>,
 }
 
@@ -331,6 +331,7 @@ impl LogRollerMeta {
             &meta.directory,
             meta.filename.as_path().as_os_str().to_string_lossy().as_ref(),
             &meta.rotation,
+            &meta.suffix,
         )?;
 
         let max_keep_files = meta.max_keep_files.unwrap_or(u64::MAX);
@@ -349,9 +350,11 @@ impl LogRollerMeta {
         directory: &PathBuf,
         filename: &str,
         rotation: &Rotation,
+        suffix: &Option<String>,
     ) -> Result<Vec<(SystemTime, DirEntry)>, LogRollerError> {
+        let suffix = suffix.clone().map(|s| format!("(.{s})?")).unwrap_or_default();
         let file_pattern = match rotation {
-            Rotation::SizeBased(_) => Regex::new(&format!(r"^{filename}(\.\d+)?(\.gz)?$"))
+            Rotation::SizeBased(_) => Regex::new(&format!(r"^{filename}(\.\d+)?{suffix}(\.gz)?$"))
                 .map_err(|err| LogRollerError::InternalError(err.to_string()))?,
             Rotation::AgeBased(rotation_age) => {
                 let pattern = match rotation_age {
@@ -359,7 +362,7 @@ impl LogRollerMeta {
                     RotationAge::Hourly => r"\d{4}-\d{2}-\d{2}-\d{2}",
                     RotationAge::Daily => r"\d{4}-\d{2}-\d{2}",
                 };
-                Regex::new(&format!(r"^{filename}\.{pattern}(\.gz)?$"))
+                Regex::new(&format!(r"^{filename}\.{pattern}{suffix}(\.gz)?$"))
                     .map_err(|err| LogRollerError::InternalError(err.to_string()))?
             }
         };
@@ -551,7 +554,7 @@ pub struct LogRollerBuilder {
 /// * Rotation type
 /// * Compression type
 /// * Maximum number of log files to keep
-/// 
+///
 /// The log roller can be built with the `build` method.
 /// # Example
 /// ```
