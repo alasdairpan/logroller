@@ -133,6 +133,8 @@ struct LogRollerMeta {
     compression: Option<Compression>,
     /// The maximum number of log files to keep.
     max_keep_files: Option<u64>,
+    /// file name suffix
+    suffix: Option<String>,
 }
 
 /// State for the log roller.
@@ -483,17 +485,20 @@ impl LogRollerMeta {
             compression: None,
             max_keep_files: None,
             time_zone: Local::now().offset().to_owned(),
+            suffix: None,
         }
     }
 
     /// Get the next log file path based on the rotation age.
     fn get_next_age_based_log_path(&self, rotation_age: &RotationAge, datetime: &DateTime<FixedOffset>) -> PathBuf {
         let path_fn = |pattern: &str| -> PathBuf {
-            self.directory.join(PathBuf::from(
-                datetime
-                    .format(&format!("{}.{pattern}", self.filename.as_path().to_string_lossy()))
-                    .to_string(),
-            ))
+            let mut tf = datetime
+                .format(&format!("{}.{pattern}", self.filename.as_path().to_string_lossy()))
+                .to_string();
+            if let Some(suffix) = &self.suffix {
+                tf = format!("{}.{}", tf, suffix);
+            }
+            self.directory.join(PathBuf::from(tf))
         };
         match rotation_age {
             RotationAge::Minutely => path_fn("%Y-%m-%d-%H-%M"),
@@ -604,6 +609,16 @@ impl LogRollerBuilder {
         Self {
             meta: LogRollerMeta {
                 max_keep_files: Some(max_keep_files),
+                ..self.meta
+            },
+        }
+    }
+
+    /// Set the suffix for the log file.
+    pub fn suffix(self, suffix: String) -> Self {
+        Self {
+            meta: LogRollerMeta {
+                suffix: Some(suffix),
                 ..self.meta
             },
         }
