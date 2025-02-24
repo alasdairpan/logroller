@@ -165,8 +165,9 @@ impl LogRollerState {
     /// * `filename` - The name of the log file.
     /// # Returns
     /// The next size-based index for the log file.
-    fn get_next_size_based_index(directory: &PathBuf, filename: &Path) -> usize {
-        let mut max_suffix = 0;
+    fn get_next_size_based_index(directory: &PathBuf, filename: &Path, max_files: usize) -> usize {
+        let mut used_indices = Vec::new();
+
         if directory.is_dir() {
             if let Ok(files) = std::fs::read_dir(directory) {
                 for file in files.flatten() {
@@ -176,7 +177,7 @@ impl LogRollerState {
                                 exist_file.strip_prefix(&format!("{}.", filename.to_string_lossy()))
                             {
                                 if let Ok(suffix) = suffix_str.parse::<usize>() {
-                                    max_suffix = std::cmp::max(max_suffix, suffix);
+                                    used_indices.push(suffix);
                                 }
                             }
                         }
@@ -184,7 +185,15 @@ impl LogRollerState {
                 }
             }
         }
-        max_suffix + 1
+
+        // Find the first available number starting from 1.
+        for i in 1..max_files {
+            if !used_indices.contains(&i) {
+                return i;
+            }
+        }
+
+        1
     }
 
     /// Get the current size of the log file.
@@ -637,6 +646,7 @@ impl LogRollerBuilder {
                 next_size_based_index: LogRollerState::get_next_size_based_index(
                     &self.meta.directory,
                     &self.meta.filename,
+                    self.meta.max_keep_files.unwrap_or(u64::MAX) as usize,
                 ),
                 next_age_based_time: self.meta.next_time(
                     self.meta.now(),
@@ -669,7 +679,11 @@ impl io::Write for LogRoller {
             match &self.meta.rotation {
                 Rotation::SizeBased(_) => {
                     self.state.curr_file_size_bytes = 0;
-                    self.state.next_size_based_index += 1;
+                    self.state.next_size_based_index = LogRollerState::get_next_size_based_index(
+                        &self.meta.directory,
+                        &self.meta.filename,
+                        self.meta.max_keep_files.unwrap_or(u64::MAX) as usize,
+                    );
                 }
                 Rotation::AgeBased(rotation_age) => {
                     self.state.curr_file_size_bytes = 0;
