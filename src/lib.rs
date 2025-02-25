@@ -159,8 +159,8 @@ impl LogRollerState {
     /// different index. For example, if the log file is `app.log`, the next
     /// log file will be `app.log.1`. If the log file is `app.log.1`, the
     /// next log file will be `app.log.2`, and so on. The index is
-    /// incremented each time a new log file is created. The index is reset
-    /// to 1 when the log file is rotated. # Arguments
+    /// incremented each time a new log file is created.
+    /// # Arguments
     /// * `directory` - The directory where the log files are stored.
     /// * `filename` - The name of the log file.
     /// # Returns
@@ -209,7 +209,8 @@ impl LogRoller {
     /// This function will check if the log file should be rolled over based on
     /// the rotation type. If the log file should be rolled over, the
     /// function will return the path to the new log file. If the log file
-    /// should not be rolled over, the function will return None. # Arguments
+    /// should not be rolled over, the function will return None.
+    /// # Arguments
     /// * `meta` - The metadata for the log roller.
     /// * `state` - The state for the log roller.
     /// # Returns
@@ -219,16 +220,9 @@ impl LogRoller {
         match &meta.rotation {
             Rotation::SizeBased(rotation_size) => {
                 if state.curr_file_size_bytes >= rotation_size.bytes() {
-                    return Some(
-                        meta.directory.join(PathBuf::from(
-                            format!(
-                                "{}.{}",
-                                meta.filename.as_path().to_string_lossy(),
-                                state.next_size_based_index
-                            )
-                            .to_string(),
-                        )),
-                    );
+                    return Some(meta.directory.join(PathBuf::from(
+                        format!("{}.1", meta.filename.as_path().to_string_lossy(),).to_string(),
+                    )));
                 }
             }
             Rotation::AgeBased(rotation_age) => {
@@ -263,7 +257,8 @@ impl LogRollerMeta {
 
     /// Get the next time for the log file rotation.
     /// This function will return the next time for the log file rotation based
-    /// on the rotation age. # Arguments
+    /// on the rotation age.
+    /// # Arguments
     /// * `base_datetime` - The base datetime.
     /// * `rotation_age` - The rotation age.
     /// # Returns
@@ -303,7 +298,8 @@ impl LogRollerMeta {
     /// If the log file already exists, the function will append to the existing
     /// log file. If the log file does not exist, the function will create a
     /// new log file. If the directory does not exist, the function will
-    /// create the directory. # Arguments
+    /// create the directory.
+    /// # Arguments
     /// * `log_path` - The path to the log file.
     /// # Returns
     /// The log file.
@@ -334,11 +330,36 @@ impl LogRollerMeta {
             &meta.suffix,
         )?;
 
-        let max_keep_files = meta.max_keep_files.unwrap_or(u64::MAX);
-        if all_log_files.len() > max_keep_files as usize {
-            for (_, file) in all_log_files.iter().take(all_log_files.len() - max_keep_files as usize) {
-                if let Err(remove_log_file_err) = fs::remove_file(file.path()) {
-                    eprintln!("Couldn't remove log file: {remove_log_file_err:?}");
+        // Remove old log files if necessary
+        if let Some(max_keep_files) = meta.max_keep_files {
+            match &meta.rotation {
+                Rotation::SizeBased(_) => {
+                    // Remove old files using the index
+                    for (_, file) in all_log_files {
+                        if let Some(index) = file
+                            .path()
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .and_then(|s| s.split('.').last())
+                            .and_then(|s| s.parse::<usize>().ok())
+                        {
+                            if index >= max_keep_files as usize {
+                                if let Err(remove_log_file_err) = fs::remove_file(file.path()) {
+                                    eprintln!("Couldn't remove log file: {remove_log_file_err:?}");
+                                }
+                            }
+                        }
+                    }
+                }
+                Rotation::AgeBased(_) => {
+                    // Remove old files using the created time
+                    if all_log_files.len() > max_keep_files as usize {
+                        for (_, file) in all_log_files.iter().take(all_log_files.len() - max_keep_files as usize) {
+                            if let Err(remove_log_file_err) = fs::remove_file(file.path()) {
+                                eprintln!("Couldn't remove log file: {remove_log_file_err:?}");
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -346,6 +367,7 @@ impl LogRollerMeta {
         Ok(())
     }
 
+    /// List all log files in the directory.
     fn list_all_files(
         directory: &PathBuf,
         filename: &str,
@@ -387,6 +409,7 @@ impl LogRollerMeta {
         Ok(all_log_files)
     }
 
+    /// Compress the log file.
     fn compress(compression: &Option<Compression>, log_path: &PathBuf) -> Result<(), LogRollerError> {
         let compression = match compression {
             Some(compression) => compression,
@@ -417,18 +440,40 @@ impl LogRollerMeta {
         Ok(())
     }
 
+    /// Refresh the writer.
+    /// This function will refresh the writer by creating a new log file and
+    /// compressing the old log file. The function will also rename the
+    /// existing log files based on the rotation type.
     fn refresh_writer(
         &self,
         writer: &mut fs::File,
         old_log_path: PathBuf,
         new_log_path: PathBuf,
+        next_size_based_index: usize,
     ) -> Result<(), LogRollerError> {
         let meta = self.to_owned();
         match &self.rotation {
             Rotation::SizeBased(_) => {
+                // 1. Rename the existing log files.
+                // If target file exists, it will be overwritten
+                for idx in (1 .. next_size_based_index).rev() {
+                    let source_file = self
+                        .directory
+                        .join(format!("{}.{}", self.filename.to_string_lossy(), idx));
+                    let target_file = self
+                        .directory
+                        .join(format!("{}.{}", self.filename.to_string_lossy(), idx + 1));
+                    // If the source file exists, rename it to the target file, otherwise skip
+                    if source_file.exists() {
+                        std::fs::rename(&source_file, &target_file).map_err(|_| LogRollerError::RenameFileError)?;
+                    }
+                }
+
+                // 2. Rename the current log file
                 let curr_log_path = self.directory.join(&self.filename);
                 std::fs::rename(&curr_log_path, &new_log_path).map_err(|_| LogRollerError::RenameFileError)?;
 
+                // 3. Create a new log file
                 match self.create_log_file(&curr_log_path) {
                     Ok(log_file) => {
                         if let Err(err) = writer.flush() {
@@ -631,13 +676,15 @@ impl LogRollerBuilder {
     /// Build the log roller.
     pub fn build(self) -> Result<LogRoller, LogRollerError> {
         let curr_file_path = self.meta.get_curr_log_path();
+        let mut next_size_based_index =
+            LogRollerState::get_next_size_based_index(&self.meta.directory, &self.meta.filename);
+        if let Some(max_keep_files) = self.meta.max_keep_files {
+            next_size_based_index = next_size_based_index.min(max_keep_files as usize);
+        }
         Ok(LogRoller {
             meta: self.meta.to_owned(),
             state: LogRollerState {
-                next_size_based_index: LogRollerState::get_next_size_based_index(
-                    &self.meta.directory,
-                    &self.meta.filename,
-                ),
+                next_size_based_index,
                 next_age_based_time: self.meta.next_time(
                     self.meta.now(),
                     match &self.meta.rotation {
@@ -660,9 +707,10 @@ impl io::Write for LogRoller {
         let writer = self.writer.get_mut().unwrap_or_else(PoisonError::into_inner);
 
         let old_log_path = self.state.curr_file_path.to_owned();
+        let next_size_based_index = self.state.next_size_based_index;
         if let Some(new_log_path) = Self::should_rollover(&self.meta, &self.state) {
             self.meta
-                .refresh_writer(writer, old_log_path, new_log_path.to_owned())
+                .refresh_writer(writer, old_log_path, new_log_path.to_owned(), next_size_based_index)
                 .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
             self.state.curr_file_path.clone_from(&new_log_path);
 
@@ -670,6 +718,11 @@ impl io::Write for LogRoller {
                 Rotation::SizeBased(_) => {
                     self.state.curr_file_size_bytes = 0;
                     self.state.next_size_based_index += 1;
+                    // If max_keep_files is set, the next_size_based_index should not exceed it
+                    if let Some(max_keep_files) = self.meta.max_keep_files {
+                        self.state.next_size_based_index =
+                            self.state.next_size_based_index.min(max_keep_files as usize);
+                    }
                 }
                 Rotation::AgeBased(rotation_age) => {
                     self.state.curr_file_size_bytes = 0;
