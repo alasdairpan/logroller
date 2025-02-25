@@ -346,16 +346,42 @@ impl LogRollerMeta {
 
         // Remove old log files if necessary
         if let Some(max_keep_files) = meta.max_keep_files {
-            if all_log_files.len() > max_keep_files as usize {
-                let iter = all_log_files.iter();
-                let n_files_to_delete = all_log_files.len() - max_keep_files as usize;
-                let files_to_delete: Vec<PathBuf> = match &meta.rotation {
-                    Rotation::SizeBased(_) => iter.rev().take(n_files_to_delete).map(|f| f.path()).collect(),
-                    Rotation::AgeBased(_) => iter.take(n_files_to_delete).map(|f| f.path()).collect(),
-                };
-                for file in files_to_delete {
-                    if let Err(remove_log_file_err) = fs::remove_file(file) {
-                        eprintln!("Couldn't remove log file: {remove_log_file_err:?}");
+            match &meta.rotation {
+                Rotation::SizeBased(_) => {
+                    for file in all_log_files {
+                        if let Some(index) = file
+                            .path()
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .and_then(|s| {
+                                let mut parts = s.split('.').collect::<Vec<&str>>();
+                                if meta.compression.is_some() {
+                                    // Remove the compression extension
+                                    parts.pop();
+                                }
+                                parts.last().cloned()
+                            })
+                            .and_then(|s| s.parse::<usize>().ok())
+                        {
+                            if index >= max_keep_files as usize {
+                                if let Err(remove_log_file_err) = fs::remove_file(file.path()) {
+                                    eprintln!("Couldn't remove log file: {remove_log_file_err:?}");
+                                }
+                            }
+                        }
+                    }
+                }
+                Rotation::AgeBased(_) => {
+                    if all_log_files.len() > max_keep_files as usize {
+                        for file in all_log_files
+                            .iter()
+                            .rev()
+                            .take(all_log_files.len() - max_keep_files as usize)
+                        {
+                            if let Err(remove_log_file_err) = fs::remove_file(file.path()) {
+                                eprintln!("Couldn't remove log file: {remove_log_file_err:?}");
+                            }
+                        }
                     }
                 }
             }
