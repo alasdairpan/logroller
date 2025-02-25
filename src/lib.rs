@@ -373,11 +373,7 @@ impl LogRollerMeta {
                 }
                 Rotation::AgeBased(_) => {
                     if all_log_files.len() > max_keep_files as usize {
-                        for file in all_log_files
-                            .iter()
-                            .rev()
-                            .take(all_log_files.len() - max_keep_files as usize)
-                        {
+                        for file in all_log_files.iter().take(all_log_files.len() - max_keep_files as usize) {
                             if let Err(remove_log_file_err) = fs::remove_file(file.path()) {
                                 eprintln!("Couldn't remove log file: {remove_log_file_err:?}");
                             }
