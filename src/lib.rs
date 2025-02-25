@@ -54,7 +54,6 @@ use {
         io::{self, Write as _},
         path::{Path, PathBuf},
         sync::{PoisonError, RwLock},
-        time::SystemTime,
     },
 };
 
@@ -88,6 +87,20 @@ pub enum Compression {
     // Zstd,
     // XZ,
     // Snappy,
+}
+
+impl Compression {
+    /// Get the extension for the compressed log file.
+    fn get_extension(&self) -> &'static str {
+        match self {
+            Compression::Gzip => "gz",
+            // Compression::Bzip2 => "bz2",
+            // Compression::LZ4 => "lz4",
+            // Compression::Zstd => "zst",
+            // Compression::XZ => "xz",
+            // Compression::Snappy => "snappy",
+        }
+    }
 }
 
 /// The time zone for the log files.
@@ -328,37 +341,21 @@ impl LogRollerMeta {
             meta.filename.as_path().as_os_str().to_string_lossy().as_ref(),
             &meta.rotation,
             &meta.suffix,
+            &meta.compression,
         )?;
 
         // Remove old log files if necessary
         if let Some(max_keep_files) = meta.max_keep_files {
-            match &meta.rotation {
-                Rotation::SizeBased(_) => {
-                    // Remove old files using the index
-                    for (_, file) in all_log_files {
-                        if let Some(index) = file
-                            .path()
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .and_then(|s| s.split('.').last())
-                            .and_then(|s| s.parse::<usize>().ok())
-                        {
-                            if index >= max_keep_files as usize {
-                                if let Err(remove_log_file_err) = fs::remove_file(file.path()) {
-                                    eprintln!("Couldn't remove log file: {remove_log_file_err:?}");
-                                }
-                            }
-                        }
-                    }
-                }
-                Rotation::AgeBased(_) => {
-                    // Remove old files using the created time
-                    if all_log_files.len() > max_keep_files as usize {
-                        for (_, file) in all_log_files.iter().take(all_log_files.len() - max_keep_files as usize) {
-                            if let Err(remove_log_file_err) = fs::remove_file(file.path()) {
-                                eprintln!("Couldn't remove log file: {remove_log_file_err:?}");
-                            }
-                        }
+            if all_log_files.len() > max_keep_files as usize {
+                let iter = all_log_files.iter();
+                let n_files_to_delete = all_log_files.len() - max_keep_files as usize;
+                let files_to_delete: Vec<PathBuf> = match &meta.rotation {
+                    Rotation::SizeBased(_) => iter.rev().take(n_files_to_delete).map(|f| f.path()).collect(),
+                    Rotation::AgeBased(_) => iter.take(n_files_to_delete).map(|f| f.path()).collect(),
+                };
+                for file in files_to_delete {
+                    if let Err(remove_log_file_err) = fs::remove_file(file) {
+                        eprintln!("Couldn't remove log file: {remove_log_file_err:?}");
                     }
                 }
             }
@@ -372,11 +369,16 @@ impl LogRollerMeta {
         directory: &PathBuf,
         filename: &str,
         rotation: &Rotation,
-        suffix: &Option<String>,
-    ) -> Result<Vec<(SystemTime, DirEntry)>, LogRollerError> {
-        let suffix = suffix.clone().map(|s| format!("(.{s})?")).unwrap_or_default();
+        file_suffix: &Option<String>,
+        compression: &Option<Compression>,
+    ) -> Result<Vec<DirEntry>, LogRollerError> {
+        let file_suffix = file_suffix.clone().map(|s| format!("(.{s})?")).unwrap_or_default();
+        let compression_suffix = compression
+            .clone()
+            .map(|c| format!("(.{})?", c.get_extension()))
+            .unwrap_or_default();
         let file_pattern = match rotation {
-            Rotation::SizeBased(_) => Regex::new(&format!(r"^{filename}(\.\d+)?{suffix}(\.gz)?$"))
+            Rotation::SizeBased(_) => Regex::new(&format!(r"^{filename}(\.\d+)?{file_suffix}{compression_suffix}$"))
                 .map_err(|err| LogRollerError::InternalError(err.to_string()))?,
             Rotation::AgeBased(rotation_age) => {
                 let pattern = match rotation_age {
@@ -384,7 +386,7 @@ impl LogRollerMeta {
                     RotationAge::Hourly => r"\d{4}-\d{2}-\d{2}-\d{2}",
                     RotationAge::Daily => r"\d{4}-\d{2}-\d{2}",
                 };
-                Regex::new(&format!(r"^{filename}\.{pattern}{suffix}(\.gz)?$"))
+                Regex::new(&format!(r"^{filename}\.{pattern}{file_suffix}{compression_suffix}$"))
                     .map_err(|err| LogRollerError::InternalError(err.to_string()))?
             }
         };
@@ -399,12 +401,13 @@ impl LogRollerMeta {
             }
             if let Some(file_name) = file.file_name().to_str() {
                 if file_pattern.is_match(file_name) {
-                    all_log_files.push((metadata.created()?, file));
+                    all_log_files.push(file);
                 }
             }
         }
 
-        all_log_files.sort_by_key(|(created_at, _)| created_at.to_owned());
+        // Sort the log files by name
+        all_log_files.sort_by_key(|f| f.file_name());
 
         Ok(all_log_files)
     }
@@ -421,9 +424,12 @@ impl LogRollerMeta {
             Compression::Gzip => {
                 let infile = fs::File::open(log_path).map_err(LogRollerError::FileIOError)?;
                 let reader = io::BufReader::new(infile);
-
-                let outfile = fs::File::create(PathBuf::from(format!("{}.gz", log_path.to_string_lossy())))
-                    .map_err(LogRollerError::FileIOError)?;
+                let outfile = fs::File::create(PathBuf::from(format!(
+                    "{}.{}",
+                    log_path.to_string_lossy(),
+                    compression.get_extension()
+                )))
+                .map_err(LogRollerError::FileIOError)?;
                 let writer = io::BufWriter::new(outfile);
 
                 let mut encoder = GzEncoder::new(writer, flate2::Compression::default());
@@ -450,6 +456,7 @@ impl LogRollerMeta {
         old_log_path: PathBuf,
         new_log_path: PathBuf,
         next_size_based_index: usize,
+        compression: &Option<Compression>,
     ) -> Result<(), LogRollerError> {
         let meta = self.to_owned();
         match &self.rotation {
@@ -457,15 +464,35 @@ impl LogRollerMeta {
                 // 1. Rename the existing log files.
                 // If target file exists, it will be overwritten
                 for idx in (1 .. next_size_based_index).rev() {
+                    // Rename original file
                     let source_file = self
                         .directory
                         .join(format!("{}.{}", self.filename.to_string_lossy(), idx));
                     let target_file = self
                         .directory
                         .join(format!("{}.{}", self.filename.to_string_lossy(), idx + 1));
-                    // If the source file exists, rename it to the target file, otherwise skip
                     if source_file.exists() {
                         std::fs::rename(&source_file, &target_file).map_err(|_| LogRollerError::RenameFileError)?;
+                    }
+
+                    // Rename compressed file
+                    if let Some(compression) = &compression {
+                        let compressed_source_file = self.directory.join(format!(
+                            "{}.{}.{}",
+                            self.filename.to_string_lossy(),
+                            idx,
+                            compression.get_extension()
+                        ));
+                        let compressed_target_file = self.directory.join(format!(
+                            "{}.{}.{}",
+                            self.filename.to_string_lossy(),
+                            idx + 1,
+                            compression.get_extension()
+                        ));
+                        if compressed_source_file.exists() {
+                            std::fs::rename(&compressed_source_file, &compressed_target_file)
+                                .map_err(|_| LogRollerError::RenameFileError)?;
+                        }
                     }
                 }
 
@@ -708,9 +735,16 @@ impl io::Write for LogRoller {
 
         let old_log_path = self.state.curr_file_path.to_owned();
         let next_size_based_index = self.state.next_size_based_index;
+        let compression = self.meta.compression.to_owned();
         if let Some(new_log_path) = Self::should_rollover(&self.meta, &self.state) {
             self.meta
-                .refresh_writer(writer, old_log_path, new_log_path.to_owned(), next_size_based_index)
+                .refresh_writer(
+                    writer,
+                    old_log_path,
+                    new_log_path.to_owned(),
+                    next_size_based_index,
+                    &compression,
+                )
                 .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
             self.state.curr_file_path.clone_from(&new_log_path);
 
