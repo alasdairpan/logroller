@@ -829,6 +829,8 @@ impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for LogRoller {
 
     fn make_writer(&'a self) -> Self::Writer {
         let old_log_path = self.state.curr_file_path.to_owned();
+        let next_size_based_index = self.state.next_size_based_index;
+        let compression = self.meta.compression.to_owned();
         if let Some(new_log_path) = Self::should_rollover(&self.meta, &self.state) {
             if let Err(refresh_writer_err) = self
                 .meta
@@ -836,6 +838,8 @@ impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for LogRoller {
                     &mut self.writer.write().unwrap_or_else(PoisonError::into_inner),
                     old_log_path,
                     new_log_path.to_owned(),
+                    next_size_based_index,
+                    &compression,
                 )
                 .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))
             {
