@@ -50,8 +50,9 @@ use {
     regex::Regex,
     std::{
         fmt::Debug,
-        fs::{self, DirEntry},
+        fs::{self, DirEntry, Permissions},
         io::{self, Write as _},
+        os::unix::fs::PermissionsExt,
         path::{Path, PathBuf},
         sync::{PoisonError, RwLock},
     },
@@ -148,6 +149,8 @@ struct LogRollerMeta {
     max_keep_files: Option<u64>,
     /// File name suffix (Only for age-based rotation)
     suffix: Option<String>,
+    /// The file permissions set for log files. (Only for Unix-like systems)
+    file_mode: Option<u32>,
 }
 
 /// State for the log roller.
@@ -330,23 +333,26 @@ impl LogRollerMeta {
         }
 
         let log_file = create_log_file_res.map_err(|err| LogRollerError::CreateFileFailed(err.to_string()))?;
+
+        self.set_permissions(log_path)?;
+
         Ok(log_file)
     }
 
     /// Process old log files.
-    fn process_old_logs(meta: &LogRollerMeta, log_path: &PathBuf) -> Result<(), LogRollerError> {
-        Self::compress(&meta.compression, log_path)?;
+    fn process_old_logs(&self, log_path: &PathBuf) -> Result<(), LogRollerError> {
+        self.compress(log_path)?;
         let all_log_files = Self::list_all_files(
-            &meta.directory,
-            meta.filename.as_path().as_os_str().to_string_lossy().as_ref(),
-            &meta.rotation,
-            &meta.suffix,
-            &meta.compression,
+            &self.directory,
+            self.filename.as_path().as_os_str().to_string_lossy().as_ref(),
+            &self.rotation,
+            &self.suffix,
+            &self.compression,
         )?;
 
         // Remove old log files if necessary
-        if let Some(max_keep_files) = meta.max_keep_files {
-            match &meta.rotation {
+        if let Some(max_keep_files) = self.max_keep_files {
+            match &self.rotation {
                 Rotation::SizeBased(_) => {
                     for file in all_log_files {
                         if let Some(index) = file
@@ -355,7 +361,7 @@ impl LogRollerMeta {
                             .and_then(|s| s.to_str())
                             .and_then(|s| {
                                 let mut parts = s.split('.').collect::<Vec<&str>>();
-                                if meta.compression.is_some() {
+                                if self.compression.is_some() {
                                     // Remove the compression extension
                                     parts.pop();
                                 }
@@ -435,8 +441,8 @@ impl LogRollerMeta {
     }
 
     /// Compress the log file.
-    fn compress(compression: &Option<Compression>, log_path: &PathBuf) -> Result<(), LogRollerError> {
-        let compression = match compression {
+    fn compress(&self, log_path: &PathBuf) -> Result<(), LogRollerError> {
+        let compression = match &self.compression {
             Some(compression) => compression,
             None => {
                 return Ok(());
@@ -446,17 +452,21 @@ impl LogRollerMeta {
             Compression::Gzip => {
                 let infile = fs::File::open(log_path).map_err(LogRollerError::FileIOError)?;
                 let reader = io::BufReader::new(infile);
-                let outfile = fs::File::create(PathBuf::from(format!(
+
+                let compressed_path = PathBuf::from(format!(
                     "{}.{}",
                     log_path.to_string_lossy(),
                     compression.get_extension()
-                )))
-                .map_err(LogRollerError::FileIOError)?;
+                ));
+                let outfile = fs::File::create(&compressed_path).map_err(LogRollerError::FileIOError)?;
                 let writer = io::BufWriter::new(outfile);
 
                 let mut encoder = GzEncoder::new(writer, flate2::Compression::default());
                 io::copy(&mut io::Read::take(reader, u64::MAX), &mut encoder)?;
                 encoder.finish()?;
+
+                // Ensures compressed file has correct permissions.
+                self.set_permissions(&compressed_path)?;
 
                 fs::remove_file(log_path).map_err(LogRollerError::FileIOError)?;
             } /* Compression::Bzip2
@@ -464,6 +474,24 @@ impl LogRollerMeta {
                * | Compression::Zstd
                * | Compression::XZ
                * | Compression::Snappy => {} */
+        }
+        Ok(())
+    }
+
+    fn set_permissions(&self, path: &Path) -> Result<(), LogRollerError> {
+        if let Some(mode) = self.file_mode {
+            #[cfg(unix)]
+            {
+                let perms = Permissions::from_mode(mode);
+                fs::set_permissions(path, perms).map_err(|err| LogRollerError::SetFilePermissionsError {
+                    path: path.to_path_buf(),
+                    error: err.to_string(),
+                })?
+            }
+            #[cfg(not(unix))]
+            {
+                eprintln!("Warning: Setting file permissions is not supported on non-Unix platforms");
+            }
         }
         Ok(())
     }
@@ -531,7 +559,7 @@ impl LogRollerMeta {
                         *writer = log_file;
 
                         std::thread::spawn(move || {
-                            if let Err(err) = Self::process_old_logs(&meta, &new_log_path) {
+                            if let Err(err) = meta.process_old_logs(&new_log_path) {
                                 eprintln!("Couldn't compress log file: {}", err);
                             }
                         });
@@ -549,7 +577,7 @@ impl LogRollerMeta {
                     *writer = log_file;
 
                     std::thread::spawn(move || {
-                        if let Err(err) = Self::process_old_logs(&meta, &old_log_path) {
+                        if let Err(err) = meta.process_old_logs(&old_log_path) {
                             eprintln!("Couldn't compress log file: {}", err);
                         }
                     });
@@ -583,6 +611,7 @@ impl LogRollerMeta {
             max_keep_files: None,
             time_zone: Local::now().offset().to_owned(),
             suffix: None,
+            file_mode: None,
         }
     }
 
@@ -634,6 +663,8 @@ pub enum LogRollerError {
     ShouldNotRotate,
     #[error("Internal error: {0}")]
     InternalError(String),
+    #[error("Failed to set file permissions for {path}: {error}")]
+    SetFilePermissionsError { path: PathBuf, error: String },
 }
 
 /// Builder for the log roller.
@@ -717,6 +748,18 @@ impl LogRollerBuilder {
         Self {
             meta: LogRollerMeta {
                 suffix: Some(suffix),
+                ..self.meta
+            },
+        }
+    }
+
+    /// Set the file permissions for log files (Unix-like systems only).
+    /// This sets the file mode bits in octal notation like when using chmod.
+    /// For example, 0o644 for rw-r--r-- permissions.
+    pub fn file_mode(self, mode: u32) -> Self {
+        Self {
+            meta: LogRollerMeta {
+                file_mode: Some(mode),
                 ..self.meta
             },
         }
