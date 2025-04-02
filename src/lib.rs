@@ -52,11 +52,13 @@ use {
         fmt::Debug,
         fs::{self, DirEntry, Permissions},
         io::{self, Write as _},
-        os::unix::fs::PermissionsExt,
         path::{Path, PathBuf},
         sync::{PoisonError, RwLock},
     },
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 /// Defines size thresholds for rotating log files in various units.
 ///
