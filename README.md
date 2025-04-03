@@ -3,6 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/logroller)](https://crates.io/crates/logroller)
 [![Docs.rs](https://docs.rs/logroller/badge.svg)](https://docs.rs/logroller)
 [![License](https://img.shields.io/crates/l/logroller)](https://img.shields.io/crates/l/logroller)
+[![CI Status](https://github.com/trayvonpan/logroller/actions/workflows/ci.yml/badge.svg)](https://github.com/trayvonpan/logroller/actions/workflows/ci.yml)
 
 LogRoller is a Rust library for efficient log writing and file rotation. It provides a simple API for writing logs to files and automatically rotating them based on size or time. It works seamlessly with the `tracing-appender` crate for use with the `tracing` framework.
 

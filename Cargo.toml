@@ -1,6 +1,6 @@
 [package]
 name = "logroller"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 authors = ["Trayvon Pan <trayvonpan@gmail.com>"]
 categories = ["development-tools::debugging"]
