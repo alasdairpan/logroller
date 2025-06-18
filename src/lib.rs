@@ -323,7 +323,9 @@ impl LogRollerState {
     /// * `log_path` - The path to the log file.
     /// # Returns
     /// The size of the log file in bytes.
-    fn get_curr_size_based_file_size(log_path: &Path) -> u64 { std::fs::metadata(log_path).map_or(0, |m| m.len()) }
+    fn get_curr_size_based_file_size(log_path: &Path) -> u64 {
+        std::fs::metadata(log_path).map_or(0, |m| m.len())
+    }
 }
 
 /// A log roller that rolls over logs based on size or age.
@@ -368,7 +370,9 @@ impl LogRoller {
 
 impl LogRollerMeta {
     /// Get the current time in the specified time zone.
-    fn now(&self) -> DateTime<FixedOffset> { Utc::now().with_timezone(&self.time_zone) }
+    fn now(&self) -> DateTime<FixedOffset> {
+        Utc::now().with_timezone(&self.time_zone)
+    }
 
     /// Replace the time in the datetime with the specified time.
     /// # Arguments
@@ -658,7 +662,7 @@ impl LogRollerMeta {
             Rotation::SizeBased(_) => {
                 // 1. Rename the existing log files.
                 // If target file exists, it will be overwritten
-                for idx in (1 .. next_size_based_index).rev() {
+                for idx in (1..next_size_based_index).rev() {
                     // Rename original file
                     let source_file = self
                         .directory
@@ -1040,68 +1044,14 @@ impl io::Write for LogRoller {
         writer.write(buf)
     }
 
-    fn flush(&mut self) -> io::Result<()> { self.writer.get_mut().unwrap_or_else(PoisonError::into_inner).flush() }
-}
-
-/// Implement the `MakeWriter` trait for the log roller.
-/// This trait is used by the `tracing_subscriber` to create a new writer for
-/// the log roller. The `MakeWriter` trait is used to create a new writer for
-/// the log roller. The `Writer` type is set to `RollingWriter`.
-/// The `make_writer` method is used to create a new writer for the log roller.
-/// # Example
-/// ```
-/// use logroller::{Compression, LogRollerBuilder, Rotation, RotationAge};
-/// use tracing_subscriber::util::SubscriberInitExt;
-///
-/// let appender = LogRollerBuilder::new("./logs", "tracing.log")
-///     .rotation(Rotation::AgeBased(RotationAge::Minutely))
-///     .max_keep_files(3)
-///     .compression(Compression::Gzip)
-///     .build()
-///     .unwrap();
-/// let (non_blocking, _guard) = tracing_appender::non_blocking(appender);
-/// tracing_subscriber::fmt()
-///     .with_writer(non_blocking)
-///     .with_ansi(false)
-///     .with_target(false)
-///     .with_file(true)
-///     .with_line_number(true)
-///     .finish()
-///     .try_init()
-///     .unwrap();
-/// ```
-#[cfg(feature = "tracing")]
-impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for LogRoller {
-    type Writer = RollingWriter<'a>;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        let old_log_path = self.state.curr_file_path.to_owned();
-        let next_size_based_index = self.state.next_size_based_index;
-        let compression = self.meta.compression.to_owned();
-        if let Some(new_log_path) = Self::should_rollover(&self.meta, &self.state) {
-            if let Err(refresh_writer_err) = self
-                .meta
-                .refresh_writer(
-                    &mut self.writer.write().unwrap_or_else(PoisonError::into_inner),
-                    old_log_path,
-                    new_log_path.to_owned(),
-                    next_size_based_index,
-                    &compression,
-                )
-                .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))
-            {
-                eprintln!("Failed to refresh writer: {refresh_writer_err}");
-            }
-        }
-        RollingWriter(self.writer.read().unwrap_or_else(PoisonError::into_inner))
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.get_mut().unwrap_or_else(PoisonError::into_inner).flush()
     }
 }
 
 #[cfg(feature = "tracing")]
-pub struct RollingWriter<'a>(std::sync::RwLockReadGuard<'a, fs::File>);
-#[cfg(feature = "tracing")]
-impl io::Write for RollingWriter<'_> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> { (&*self.0).write(buf) }
-
-    fn flush(&mut self) -> io::Result<()> { (&*self.0).flush() }
-}
+#[deprecated(
+    since = "0.1.9",
+    note = "Use LogRoller directly as an appender with tracing_appender::non_blocking"
+)]
+type _TracingFeatureIsDeprecated = ();

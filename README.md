@@ -34,7 +34,7 @@ LogRoller is a Rust library for efficient log writing and file rotation. It prov
   - Support for UTC, local, or custom time zones
   - Consistent log timing across different deployment environments
 - **Thread-safe**: Designed for safe concurrent usage with proper locking mechanisms
-- **Tracing Support**: Seamless integration with the `tracing` framework
+- **Tracing Support**: Seamless integration with [tracing](https://github.com/tokio-rs/tracing) - use LogRoller directly as an appender with [tracing-appender](https://crates.io/crates/tracing-appender)
 - **Compression**: Automatic Gzip compression for rotated log files
 
 ## Installation 📦
@@ -42,13 +42,9 @@ LogRoller is a Rust library for efficient log writing and file rotation. It prov
 Add `logroller` to your `Cargo.toml`:
 
 ```toml
-# For basic logging functionality
+# For basic logging or with tracing framework
 [dependencies]
 logroller = "0.1"
-
-# For tracing framework integration
-[dependencies]
-logroller = { version = "0.1", features = ["tracing"] }
 ```
 
 ## Usage 🚀
