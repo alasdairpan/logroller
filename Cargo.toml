@@ -9,7 +9,7 @@ license = "MIT"
 name = "logroller"
 readme = "README.md"
 repository = "https://github.com/trayvonpan/logroller/"
-version = "0.1.8"
+version = "0.1.9"
 
 [workspace.dependencies]
 tracing-subscriber = {version = "0.3"}
