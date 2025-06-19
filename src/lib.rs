@@ -1021,6 +1021,7 @@ impl LogRollerBuilder {
     }
 }
 
+#[allow(clippy::io_other_error)]
 impl io::Write for LogRoller {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let writer = self.writer.get_mut().unwrap_or_else(PoisonError::into_inner);
@@ -1099,6 +1100,7 @@ impl io::Write for LogRoller {
 ///     .unwrap();
 /// ```
 #[cfg(feature = "tracing")]
+#[allow(clippy::io_other_error)]
 impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for LogRoller {
     type Writer = RollingWriter<'a>;
 
