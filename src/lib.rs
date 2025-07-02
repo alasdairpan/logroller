@@ -132,6 +132,7 @@ pub enum Compression {
     // Bzip2,
     // LZ4,
     // Zstd,
+    /// XZ compression which provide highest compression ratio but slower processing
     XZ,
     // Snappy,
 }
@@ -898,6 +899,7 @@ pub enum LogRollerError {
 ///     .time_zone(TimeZone::UTC)  // Use UTC for consistent timing
 ///     .max_keep_files(24)        // Keep one day's worth of hourly logs
 ///     .compression(Compression::Gzip)  // Compress old logs
+///     //.compression(Compression::XZ)  // Compress using XZ. Highest compression ratio but slower processing
 ///     .suffix("error".to_string())  // Name format: app.log.2025-04-01-19.error
 ///     .build()
 ///     .unwrap();
