@@ -132,7 +132,7 @@ pub enum Compression {
     // Bzip2,
     // LZ4,
     // Zstd,
-    // XZ,
+    XZ,
     // Snappy,
 }
 
@@ -144,7 +144,7 @@ impl Compression {
             // Compression::Bzip2 => "bz2",
             // Compression::LZ4 => "lz4",
             // Compression::Zstd => "zst",
-            // Compression::XZ => "xz",
+            Compression::XZ => "xz",
             // Compression::Snappy => "snappy",
         }
     }
@@ -323,7 +323,9 @@ impl LogRollerState {
     /// * `log_path` - The path to the log file.
     /// # Returns
     /// The size of the log file in bytes.
-    fn get_curr_size_based_file_size(log_path: &Path) -> u64 { std::fs::metadata(log_path).map_or(0, |m| m.len()) }
+    fn get_curr_size_based_file_size(log_path: &Path) -> u64 {
+        std::fs::metadata(log_path).map_or(0, |m| m.len())
+    }
 }
 
 /// A log roller that rolls over logs based on size or age.
@@ -368,7 +370,9 @@ impl LogRoller {
 
 impl LogRollerMeta {
     /// Get the current time in the specified time zone.
-    fn now(&self) -> DateTime<FixedOffset> { Utc::now().with_timezone(&self.time_zone) }
+    fn now(&self) -> DateTime<FixedOffset> {
+        Utc::now().with_timezone(&self.time_zone)
+    }
 
     /// Replace the time in the datetime with the specified time.
     /// # Arguments
@@ -565,33 +569,35 @@ impl LogRollerMeta {
                 return Ok(());
             }
         };
+        let infile = fs::File::open(log_path).map_err(LogRollerError::FileIOError)?;
+        let mut reader = io::BufReader::new(infile);
+
+        let compressed_path = PathBuf::from(format!(
+            "{}.{}",
+            log_path.to_string_lossy(),
+            compression.get_extension()
+        ));
+        let outfile = fs::File::create(&compressed_path).map_err(LogRollerError::FileIOError)?;
+        let mut writer = io::BufWriter::new(outfile);
+
         match compression {
             Compression::Gzip => {
-                let infile = fs::File::open(log_path).map_err(LogRollerError::FileIOError)?;
-                let reader = io::BufReader::new(infile);
-
-                let compressed_path = PathBuf::from(format!(
-                    "{}.{}",
-                    log_path.to_string_lossy(),
-                    compression.get_extension()
-                ));
-                let outfile = fs::File::create(&compressed_path).map_err(LogRollerError::FileIOError)?;
-                let writer = io::BufWriter::new(outfile);
-
                 let mut encoder = GzEncoder::new(writer, flate2::Compression::default());
                 io::copy(&mut io::Read::take(reader, u64::MAX), &mut encoder)?;
                 encoder.finish()?;
-
-                // Ensures compressed file has correct permissions.
-                self.set_permissions(&compressed_path)?;
-
-                fs::remove_file(log_path).map_err(LogRollerError::FileIOError)?;
-            } /* Compression::Bzip2
+            },
+            Compression::XZ => { 
+                lzma_rs::xz_compress(&mut reader, &mut writer)?;
+            },
+                /* Compression::Bzip2
                * | Compression::LZ4
                * | Compression::Zstd
-               * | Compression::XZ
                * | Compression::Snappy => {} */
         }
+        // Ensures compressed file has correct permissions.
+        self.set_permissions(&compressed_path)?;
+
+        fs::remove_file(log_path).map_err(LogRollerError::FileIOError)?;
         Ok(())
     }
 
@@ -656,9 +662,11 @@ impl LogRollerMeta {
         let meta = self.to_owned();
         match &self.rotation {
             Rotation::SizeBased(_) => {
+                let curr_log_path = self.directory.join(&self.filename);
+
                 // 1. Rename the existing log files.
                 // If target file exists, it will be overwritten
-                for idx in (1 .. next_size_based_index).rev() {
+                for idx in (1..next_size_based_index).rev() {
                     // Rename original file
                     let source_file = self
                         .directory
@@ -701,57 +709,70 @@ impl LogRollerMeta {
                 }
 
                 // 2. Rename the current log file
-                let curr_log_path = self.directory.join(&self.filename);
                 std::fs::rename(&curr_log_path, &new_log_path).map_err(|err| LogRollerError::RenameFileError {
                     from: curr_log_path.clone(),
                     to: new_log_path.clone(),
                     error: err.to_string(),
                 })?;
 
-                // 3. Create a new log file
-                match self.create_log_file(&curr_log_path) {
-                    Ok(log_file) => {
-                        if let Err(err) = writer.flush() {
-                            eprintln!("Failed to flush writer: {}", err);
-                        }
-                        *writer = log_file;
-
-                        std::thread::spawn(move || {
-                            if let Err(err) = meta.process_old_logs(&new_log_path) {
-                                eprintln!(
-                                    "Failed to process old log files for '{}': {}",
-                                    new_log_path.display(),
-                                    err
-                                );
-                            }
-                        });
-                    }
+                // 3. Create a new log file and ensure proper cleanup on failure
+                let new_log_file = match self.create_log_file(&curr_log_path) {
+                    Ok(file) => file,
                     Err(err) => {
                         eprintln!("Failed to create new log file '{}': {}", curr_log_path.display(), err);
+                        return Err(err);
                     }
-                }
-            }
-            Rotation::AgeBased(_) => match self.create_log_file(&new_log_path) {
-                Ok(log_file) => {
-                    if let Err(err) = writer.flush() {
-                        eprintln!("Failed to flush writer for '{}': {}", new_log_path.display(), err);
-                    }
-                    *writer = log_file;
+                };
 
-                    std::thread::spawn(move || {
-                        if let Err(err) = meta.process_old_logs(&old_log_path) {
-                            eprintln!(
-                                "Failed to process old log files for '{}': {}",
-                                old_log_path.display(),
-                                err
-                            );
-                        }
-                    });
+                // 4. Only update writer after successful file creation
+                if let Err(err) = writer.flush() {
+                    eprintln!("Failed to flush writer: {}", err);
+                    return Err(LogRollerError::FileIOError(err));
                 }
-                Err(err) => {
-                    eprintln!("Failed to create new log file '{}': {}", new_log_path.display(), err);
+                *writer = new_log_file;
+
+                // 5. Process old logs asynchronously
+                std::thread::spawn(move || {
+                    if let Err(err) = meta.process_old_logs(&new_log_path) {
+                        eprintln!(
+                            "Failed to process old log files for '{}': {}",
+                            new_log_path.display(),
+                            err
+                        );
+                    }
+                });
+            }
+            Rotation::AgeBased(_) => {
+                // 1. Create the new log file first
+                let new_log_file = match self.create_log_file(&new_log_path) {
+                    Ok(file) => file,
+                    Err(err) => {
+                        // Failed to create new file - keep using the existing one
+                        eprintln!("Failed to create new log file '{}': {}", new_log_path.display(), err);
+                        return Err(err);
+                    }
+                };
+
+                // 2. Flush the existing writer before switching
+                if let Err(err) = writer.flush() {
+                    eprintln!("Failed to flush writer for '{}': {}", new_log_path.display(), err);
+                    return Err(LogRollerError::FileIOError(err));
                 }
-            },
+
+                // 3. Update writer with new file only after successful flush
+                *writer = new_log_file;
+
+                // 4. Process old logs asynchronously
+                std::thread::spawn(move || {
+                    if let Err(err) = meta.process_old_logs(&old_log_path) {
+                        eprintln!(
+                            "Failed to process old log files for '{}': {}",
+                            old_log_path.display(),
+                            err
+                        );
+                    }
+                });
+            }
         }
         Ok(())
     }
@@ -998,6 +1019,7 @@ impl LogRollerBuilder {
     }
 }
 
+#[allow(clippy::io_other_error)]
 impl io::Write for LogRoller {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let writer = self.writer.get_mut().unwrap_or_else(PoisonError::into_inner);
@@ -1005,6 +1027,12 @@ impl io::Write for LogRoller {
         let old_log_path = self.state.curr_file_path.to_owned();
         let next_size_based_index = self.state.next_size_based_index;
         let compression = self.meta.compression.to_owned();
+
+        // Write the log data to the current file
+        let bytes = writer.write(buf)?;
+        self.state.curr_file_size_bytes += bytes as u64;
+
+        // Check if we need to rollover the log file
         if let Some(new_log_path) = Self::should_rollover(&self.meta, &self.state) {
             self.meta
                 .refresh_writer(
@@ -1036,72 +1064,17 @@ impl io::Write for LogRoller {
                 }
             }
         }
-        self.state.curr_file_size_bytes += buf.len() as u64;
-        writer.write(buf)
+        Ok(bytes)
     }
 
-    fn flush(&mut self) -> io::Result<()> { self.writer.get_mut().unwrap_or_else(PoisonError::into_inner).flush() }
-}
-
-/// Implement the `MakeWriter` trait for the log roller.
-/// This trait is used by the `tracing_subscriber` to create a new writer for
-/// the log roller. The `MakeWriter` trait is used to create a new writer for
-/// the log roller. The `Writer` type is set to `RollingWriter`.
-/// The `make_writer` method is used to create a new writer for the log roller.
-/// # Example
-/// ```
-/// use logroller::{Compression, LogRollerBuilder, Rotation, RotationAge};
-/// use tracing_subscriber::util::SubscriberInitExt;
-///
-/// let appender = LogRollerBuilder::new("./logs", "tracing.log")
-///     .rotation(Rotation::AgeBased(RotationAge::Minutely))
-///     .max_keep_files(3)
-///     .compression(Compression::Gzip)
-///     .build()
-///     .unwrap();
-/// let (non_blocking, _guard) = tracing_appender::non_blocking(appender);
-/// tracing_subscriber::fmt()
-///     .with_writer(non_blocking)
-///     .with_ansi(false)
-///     .with_target(false)
-///     .with_file(true)
-///     .with_line_number(true)
-///     .finish()
-///     .try_init()
-///     .unwrap();
-/// ```
-#[cfg(feature = "tracing")]
-impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for LogRoller {
-    type Writer = RollingWriter<'a>;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        let old_log_path = self.state.curr_file_path.to_owned();
-        let next_size_based_index = self.state.next_size_based_index;
-        let compression = self.meta.compression.to_owned();
-        if let Some(new_log_path) = Self::should_rollover(&self.meta, &self.state) {
-            if let Err(refresh_writer_err) = self
-                .meta
-                .refresh_writer(
-                    &mut self.writer.write().unwrap_or_else(PoisonError::into_inner),
-                    old_log_path,
-                    new_log_path.to_owned(),
-                    next_size_based_index,
-                    &compression,
-                )
-                .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))
-            {
-                eprintln!("Failed to refresh writer: {refresh_writer_err}");
-            }
-        }
-        RollingWriter(self.writer.read().unwrap_or_else(PoisonError::into_inner))
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.get_mut().unwrap_or_else(PoisonError::into_inner).flush()
     }
 }
 
 #[cfg(feature = "tracing")]
-pub struct RollingWriter<'a>(std::sync::RwLockReadGuard<'a, fs::File>);
-#[cfg(feature = "tracing")]
-impl io::Write for RollingWriter<'_> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> { (&*self.0).write(buf) }
-
-    fn flush(&mut self) -> io::Result<()> { (&*self.0).flush() }
-}
+#[deprecated(
+    since = "0.1.9",
+    note = "Use LogRoller directly as an appender with tracing_appender::non_blocking"
+)]
+type _TracingFeatureIsDeprecated = ();
