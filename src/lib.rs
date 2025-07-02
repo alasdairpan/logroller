@@ -134,7 +134,15 @@ pub enum Compression {
     // Bzip2,
     // LZ4,
     // Zstd,
-    /// XZ compression which provide highest compression ratio but slower processing
+    /// XZ compression.
+    ///
+    /// Offers the highest compression ratio but significantly slower processing speed.
+    /// Accepts a compression level from `0` to `9`:
+    /// - `0`: Minimal compression, fastest speed, smallest memory usage.
+    /// - `9`: Maximum compression, slowest speed, highest memory usage.
+    ///
+    /// Higher compression levels require larger dictionary sizes and more RAM.
+    /// Ensure that the compression level is within the valid range to avoid runtime errors.
     XZ(u32),
     // Snappy,
 }
