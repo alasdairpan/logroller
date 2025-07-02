@@ -1,32 +1,31 @@
 [package]
-name = "logroller"
-version = "0.1.8"
-edition = "2021"
 authors = ["Trayvon Pan <trayvonpan@gmail.com>"]
 categories = ["development-tools::debugging"]
-description = "A Rust library for automatic file rotation, working with the `tracing-appender` crate."
+description = "A feature-rich log rotation library with timezone support, flexible rotation strategies, and compression, integrating seamlessly with the tracing ecosystem."
 documentation = "https://docs.rs/logroller/"
+edition = "2021"
 keywords = ["logging", "tracing", "tracing-appender"]
 license = "MIT"
-repository = "https://github.com/trayvonpan/logroller/"
+name = "logroller"
 readme = "README.md"
+repository = "https://github.com/trayvonpan/logroller/"
+version = "0.1.9"
 
 [workspace.dependencies]
-tracing-subscriber = { version = "0.3" }
+tracing-subscriber = {version = "0.3"}
 
 [dependencies]
 chrono = "0.4"
-thiserror = "1.0"
 flate2 = "1.0"
 regex = "1"
-tracing-subscriber = { workspace = true, optional = true }
-lzma-rs = "0.3.0"
+thiserror = "1.0"
+tracing-subscriber = {workspace = true, optional = true}
 
 [dev-dependencies]
 tracing = "0.1"
 tracing-appender = "0.2"
-tracing-subscriber = { workspace = true }
+tracing-subscriber = {workspace = true}
 
 [features]
 default = []
-tracing = ["dep:tracing-subscriber"]
+tracing = ["dep:tracing-subscriber"] # Deprecated feature maintained for compatibility
