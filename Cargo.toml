@@ -17,6 +17,7 @@ tracing-subscriber = {version = "0.3"}
 [dependencies]
 chrono = "0.4"
 flate2 = "1.0"
+lzma-rs = "0.3.0"
 regex = "1"
 thiserror = "1.0"
 tracing-subscriber = {workspace = true, optional = true}
