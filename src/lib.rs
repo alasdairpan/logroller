@@ -585,14 +585,15 @@ impl LogRollerMeta {
                 let mut encoder = GzEncoder::new(writer, flate2::Compression::default());
                 io::copy(&mut io::Read::take(reader, u64::MAX), &mut encoder)?;
                 encoder.finish()?;
-            },
-            Compression::XZ => { 
+            }
+            Compression::XZ => {
                 lzma_rs::xz_compress(&mut reader, &mut writer)?;
-            },
-                /* Compression::Bzip2
-               * | Compression::LZ4
-               * | Compression::Zstd
-               * | Compression::Snappy => {} */
+                writer.flush()?;
+            }
+            /* Compression::Bzip2
+             * | Compression::LZ4
+             * | Compression::Zstd
+             * | Compression::Snappy => {} */
         }
         // Ensures compressed file has correct permissions.
         self.set_permissions(&compressed_path)?;
