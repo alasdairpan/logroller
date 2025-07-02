@@ -54,7 +54,7 @@ use {
         io::{self, Write as _},
         path::{Path, PathBuf},
         sync::{PoisonError, RwLock},
-    },
+    }, xz2::write::XzEncoder,
 };
 
 #[cfg(unix)]
@@ -571,7 +571,7 @@ impl LogRollerMeta {
             }
         };
         let infile = fs::File::open(log_path).map_err(LogRollerError::FileIOError)?;
-        let mut reader = io::BufReader::new(infile);
+        let reader = io::BufReader::new(infile);
 
         let compressed_path = PathBuf::from(format!(
             "{}.{}",
@@ -579,7 +579,7 @@ impl LogRollerMeta {
             compression.get_extension()
         ));
         let outfile = fs::File::create(&compressed_path).map_err(LogRollerError::FileIOError)?;
-        let mut writer = io::BufWriter::new(outfile);
+        let writer = io::BufWriter::new(outfile);
 
         match compression {
             Compression::Gzip => {
@@ -588,8 +588,9 @@ impl LogRollerMeta {
                 encoder.finish()?;
             }
             Compression::XZ => {
-                lzma_rs::xz_compress(&mut reader, &mut writer)?;
-                writer.flush()?;
+                let mut encoder = XzEncoder::new(writer, 9);
+                io::copy(&mut io::Read::take(reader, u64::MAX), &mut encoder)?;
+                encoder.finish()?;
             }
             /* Compression::Bzip2
              * | Compression::LZ4
