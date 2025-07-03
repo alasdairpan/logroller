@@ -874,8 +874,8 @@ pub enum LogRollerError {
     InternalError(String),
     #[error("Failed to set file permissions for '{path}': {error}")]
     SetFilePermissionsError { path: PathBuf, error: String },
-    #[error("Invalid XZ Compression rate {rate}. must be 0 < n < 10 ")]
-    InvalidXZCompressionRate { rate: u32 },
+    #[error("Invalid XZ compression level {level}. must be 0 ≤ n ≤ 9 ")]
+    InvalidXZCompressionRate { level: u32 },
 }
 
 /// Provides a fluent interface for configuring LogRoller instances.
@@ -1024,10 +1024,10 @@ impl LogRollerBuilder {
             next_size_based_index = next_size_based_index.min(max_keep_files as usize);
         }
 
-        // Error checking for invalid compression rate.
-        if let Some(Compression::XZ(n)) = self.meta.compression {
-            if n == 0 || n > 9 {
-                return Err(LogRollerError::InvalidXZCompressionRate { rate: n });
+        // Error checking for invalid compression level.
+        if let Some(Compression::XZ(level)) = self.meta.compression {
+            if level > 9 {
+                return Err(LogRollerError::InvalidXZCompressionRate { level });
             }
         }
         Ok(LogRoller {
