@@ -20,7 +20,7 @@ flate2 = "1.0"
 regex = "1"
 thiserror = "1.0"
 tracing-subscriber = {workspace = true, optional = true}
-xz2 = "0.1.7"
+xz2 = "0.1"
 
 [dev-dependencies]
 tracing = "0.1"
