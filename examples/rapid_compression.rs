@@ -5,7 +5,7 @@ use {
         time::{Instant},
     },
 };
-/// This is imulatin if there are lost of data during compression.
+/// This is simulatin if there are lost of data during compression.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start = Instant::now();
     let mut logger = LogRollerBuilder::new("./logs", "sized.log")
