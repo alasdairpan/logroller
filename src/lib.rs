@@ -56,8 +56,10 @@ use {
         sync::{PoisonError, RwLock},
         thread::JoinHandle,
     },
-    xz2::write::XzEncoder,
 };
+
+#[cfg(feature = "xz")]
+use xz2::write::XzEncoder;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -143,6 +145,9 @@ pub enum Compression {
     ///
     /// Higher compression levels require larger dictionary sizes and more RAM.
     /// Ensure that the compression level is within the valid range to avoid runtime errors.
+    /// 
+    /// **Note:** Requires the `xz` feature to be enabled.
+    #[cfg(feature = "xz")]
     XZ(u32),
     // Snappy,
 }
@@ -155,6 +160,7 @@ impl Compression {
             // Compression::Bzip2 => "bz2",
             // Compression::LZ4 => "lz4",
             // Compression::Zstd => "zst",
+            #[cfg(feature = "xz")]
             Compression::XZ(_) => "xz",
             // Compression::Snappy => "snappy",
         }
@@ -607,6 +613,7 @@ impl LogRollerMeta {
                 io::copy(&mut io::Read::take(reader, u64::MAX), &mut encoder)?;
                 encoder.finish()?;
             }
+            #[cfg(feature = "xz")]
             Compression::XZ(level) => {
                 let mut encoder = XzEncoder::new(writer, *level);
                 io::copy(&mut io::Read::take(reader, u64::MAX), &mut encoder)?;
@@ -877,6 +884,7 @@ pub enum LogRollerError {
     InternalError(String),
     #[error("Failed to set file permissions for '{path}': {error}")]
     SetFilePermissionsError { path: PathBuf, error: String },
+    #[cfg(feature = "xz")]
     #[error("Invalid XZ compression level {level}. must be 0 ≤ n ≤ 9 ")]
     InvalidXZCompressionRate { level: u32 },
 }
@@ -1045,6 +1053,7 @@ impl LogRollerBuilder {
         }
 
         // Error checking for invalid compression level.
+        #[cfg(feature = "xz")]
         if let Some(Compression::XZ(level)) = self.meta.compression {
             if level > 9 {
                 return Err(LogRollerError::InvalidXZCompressionRate { level });

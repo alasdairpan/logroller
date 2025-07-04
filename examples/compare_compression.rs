@@ -20,19 +20,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let log_name = format!("{}/{}", LOG_FOLDER, log_name);
 
     std::fs::remove_file(&log_name)?;
-    for n in 0..=9 {
-        let log_name = format!("xz_rate_{}.log", n);
-        let mut logger = LogRollerBuilder::new(LOG_FOLDER, &log_name)
-            .rotation(Rotation::SizeBased(RotationSize::MB(1)))
-            .max_keep_files(2)
-            .compression(logroller::Compression::XZ(n))
-            .build()?;
+    
+    #[cfg(feature = "xz")]
+    {
+        for n in 0..=9 {
+            let log_name = format!("xz_rate_{}.log", n);
+            let mut logger = LogRollerBuilder::new(LOG_FOLDER, &log_name)
+                .rotation(Rotation::SizeBased(RotationSize::MB(1)))
+                .max_keep_files(2)
+                .compression(logroller::Compression::XZ(n))
+                .build()?;
 
-        // Simulate writing logs that will trigger size-based rotation
-        writing_log(&mut logger)?;
-        let log_name = format!("{}/{}", LOG_FOLDER, log_name);
+            // Simulate writing logs that will trigger size-based rotation
+            writing_log(&mut logger)?;
+            let log_name = format!("{}/{}", LOG_FOLDER, log_name);
 
-        std::fs::remove_file(&log_name)?;
+            std::fs::remove_file(&log_name)?;
+        }
+    }
+    
+    #[cfg(not(feature = "xz"))]
+    {
+        println!("XZ compression examples skipped. Enable 'xz' feature to run XZ compression tests.");
     }
     println!("Done Compressing: {:?}", start.elapsed());
     println!("File | Compression percentage | Bytes");

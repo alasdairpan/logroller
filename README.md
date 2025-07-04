@@ -35,7 +35,7 @@ LogRoller is a Rust library for efficient log writing and file rotation. It prov
   - Consistent log timing across different deployment environments
 - **Thread-safe**: Designed for safe concurrent usage with proper locking mechanisms
 - **Tracing Support**: Seamless integration with [tracing](https://github.com/tokio-rs/tracing) - use LogRoller directly as an appender with [tracing-appender](https://crates.io/crates/tracing-appender)
-- **Compression**: Automatic Gzip compression for rotated log files
+- **Compression**: Automatic compression for rotated log files (Gzip included, XZ with `xz` feature)
 
 ## Installation 📦
 
@@ -45,6 +45,9 @@ Add `logroller` to your `Cargo.toml`:
 # For basic logging or with tracing framework
 [dependencies]
 logroller = "0.1"
+
+# Enable XZ compression support (optional)
+logroller = { version = "0.1", features = ["xz"] }
 ```
 
 ## Usage 🚀
@@ -175,6 +178,26 @@ let logger = LogRollerBuilder::new("./logs", "large_app.log")
     .build()?;
 ```
 
+### XZ Compression (Feature Flag)
+
+XZ compression provides the highest compression ratios but requires enabling the `xz` feature:
+
+```rust
+// Cargo.toml
+// logroller = { version = "0.1", features = ["xz"] }
+
+use logroller::{Compression, LogRollerBuilder, Rotation, RotationAge};
+
+let logger = LogRollerBuilder::new("./logs", "compressed.log")
+    .rotation(Rotation::AgeBased(RotationAge::Daily))
+    .compression(Compression::XZ(6))  // Compression level 0-9
+    .build()?;
+```
+
+- **Compression levels**: 0 (fastest) to 9 (highest compression)
+- **Trade-offs**: Higher compression levels use more CPU and memory
+- **Best for**: Archive logs where compression ratio is more important than speed
+
 ### Graceful Shutdown
 
 ```rust
@@ -196,6 +219,7 @@ let mut logger = LogRollerBuilder::new("./logs", "graceful.log")
 - Enable compression for rotated files to save disk space
 - Consider time-based rotation for predictable file sizes
 - Use appropriate rotation sizes to balance between file handling overhead and disk usage
+- XZ compression: Provides highest compression ratios but uses more CPU and memory. On some low memory devices (etc. Embedded Devices), high ratios may fail to start compression. [More info](https://man.archlinux.org/man/xz.1.en#:~:text=The%20following%20table%20summarises%20the%20features%20of%20the%20presets%3A) (enable with `xz` feature)
 - Set reasonable `max_keep_files` to prevent excessive disk usage
 
 ## Troubleshooting 🔧
