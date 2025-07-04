@@ -175,6 +175,21 @@ let logger = LogRollerBuilder::new("./logs", "large_app.log")
     .build()?;
 ```
 
+### Graceful Shutdown
+
+```rust
+let mut logger = LogRollerBuilder::new("./logs", "graceful.log")
+    .rotation(Rotation::AgeBased(RotationAge::Daily))
+    .graceful_shutdown(true)  // Enable graceful shutdown
+    .build()?;
+```
+
+- LogRoller provides graceful shutdown functionality to ensure proper cleanup of background operations: (default is `false`)
+- When `graceful_shutdown` is `true`, `flush()` waits for background compression threads to complete
+- When `graceful_shutdown` is `false` (default), `flush()` returns immediately without waiting
+- Setting to `false` prevents potential hangs during shutdown but may cause compression corruption
+
+
 ## Performance Considerations 🚀
 
 - Use `tracing-appender::non_blocking` for non-blocking log writes

@@ -1,9 +1,6 @@
 use {
     logroller::{LogRollerBuilder, Rotation, RotationSize},
-    std::{
-        io::Write,
-        time::{Instant},
-    },
+    std::{io::Write, time::Instant},
 };
 /// This is simulatin if there are lost of data during compression.
 fn main() -> Result<(), Box<dyn std::error::Error>> {

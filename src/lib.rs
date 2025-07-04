@@ -275,6 +275,8 @@ struct LogRollerMeta {
     /// rw-r--r--). On non-Unix systems, this setting is ignored with a
     /// warning message.
     file_mode: Option<u32>,
+    /// Waits for both compression and old file cleanup during shutdown.
+    graceful_shutdown: bool,
 }
 
 /// State for the log roller.
@@ -821,6 +823,7 @@ impl LogRollerMeta {
             time_zone: Local::now().offset().to_owned(),
             suffix: None,
             file_mode: None,
+            graceful_shutdown: false,
         }
     }
 
@@ -1015,6 +1018,23 @@ impl LogRollerBuilder {
         }
     }
 
+    /// Determines whether the application should attempt a graceful shutdown.
+    /// When set to `true`, the application will perform cleanup operations and
+    /// allow in-progress tasks to complete before shutting down. If set to `false`,
+    /// the application may terminate immediately without waiting for ongoing tasks
+    /// such as compression thread. May cause compression corruption,
+    /// but avoids potential hangs during shutdown.
+    /// By default, this is set to `false`, meaning the application will not perform
+    /// a graceful shutdown unless explicitly enabled.
+    pub fn graceful_shutdown(self, graceful_shutdown: bool) -> Self {
+        Self {
+            meta: LogRollerMeta {
+                graceful_shutdown,
+                ..self.meta
+            },
+        }
+    }
+
     /// Build the log roller.
     pub fn build(self) -> Result<LogRoller, LogRollerError> {
         let curr_file_path = self.meta.get_curr_log_path();
@@ -1069,17 +1089,7 @@ impl io::Write for LogRoller {
         if let Some(handle) = &self.compressing_handle {
             if !handle.is_finished() {
                 return Ok(bytes);
-            } 
-            // else {
-            //     let result = handle.join();
-            //     if let Err(err) = result {
-            //         eprintln!(
-            //             "Failed to compress old log files: {:?}",
-            //             // new_log_path.display(),
-            //             err
-            //         );
-            //     }
-            // }
+            }
         };
 
         // Check if we need to rollover the log file
@@ -1121,6 +1131,12 @@ impl io::Write for LogRoller {
 
     fn flush(&mut self) -> io::Result<()> {
         self.writer.get_mut().unwrap_or_else(PoisonError::into_inner).flush()?;
+
+        //Skips waiting for thread to finish if graceful_shutdown == false
+        if !self.meta.graceful_shutdown {
+            return Ok(());
+        }
+
         if let Some(handle) = self.compressing_handle.take() {
             let _ = handle.join();
         }
