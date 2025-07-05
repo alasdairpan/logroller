@@ -11,7 +11,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     // Simulate writing logs that will trigger size-based rotation
-    for i in 1 ..= 1000 {
+    for i in 1..=1000 {
         writeln!(
             logger,
             "Log entry #{}: This is a sample log message that will contribute to file size",

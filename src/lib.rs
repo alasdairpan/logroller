@@ -54,8 +54,12 @@ use {
         io::{self, Write as _},
         path::{Path, PathBuf},
         sync::{PoisonError, RwLock},
+        thread::JoinHandle,
     },
 };
+
+#[cfg(feature = "xz")]
+use xz2::write::XzEncoder;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -132,7 +136,19 @@ pub enum Compression {
     // Bzip2,
     // LZ4,
     // Zstd,
-    // XZ,
+    /// XZ compression.
+    ///
+    /// Offers the highest compression ratio but significantly slower processing speed.
+    /// Accepts a compression level from `0` to `9`:
+    /// - `0`: Minimal compression, fastest speed, smallest memory usage.
+    /// - `9`: Maximum compression, slowest speed, highest memory usage.
+    ///
+    /// Higher compression levels require larger dictionary sizes and more RAM.
+    /// Ensure that the compression level is within the valid range to avoid runtime errors.
+    /// 
+    /// **Note:** Requires the `xz` feature to be enabled.
+    #[cfg(feature = "xz")]
+    XZ(u32),
     // Snappy,
 }
 
@@ -144,7 +160,8 @@ impl Compression {
             // Compression::Bzip2 => "bz2",
             // Compression::LZ4 => "lz4",
             // Compression::Zstd => "zst",
-            // Compression::XZ => "xz",
+            #[cfg(feature = "xz")]
+            Compression::XZ(_) => "xz",
             // Compression::Snappy => "snappy",
         }
     }
@@ -264,6 +281,8 @@ struct LogRollerMeta {
     /// rw-r--r--). On non-Unix systems, this setting is ignored with a
     /// warning message.
     file_mode: Option<u32>,
+    /// Waits for both compression and old file cleanup during shutdown.
+    graceful_shutdown: bool,
 }
 
 /// State for the log roller.
@@ -289,6 +308,8 @@ impl LogRollerState {
     /// log file will be `app.log.1`. If the log file is `app.log.1`, the
     /// next log file will be `app.log.2`, and so on. The index is
     /// incremented each time a new log file is created.
+    /// Same goes for compressed file `app.log.1.gz`, the next log file will
+    /// be `app.log.2.gz`
     /// # Arguments
     /// * `directory` - The directory where the log files are stored.
     /// * `filename` - The name of the log file.
@@ -296,19 +317,24 @@ impl LogRollerState {
     /// The next size-based index for the log file.
     fn get_next_size_based_index(directory: &PathBuf, filename: &Path) -> usize {
         let mut max_suffix = 0;
-        if directory.is_dir() {
-            if let Ok(files) = std::fs::read_dir(directory) {
-                for file in files.flatten() {
-                    if let Some(exist_file) = file.file_name().to_str() {
-                        if exist_file.starts_with(&filename.to_string_lossy().to_string()) {
-                            if let Some(suffix_str) =
-                                exist_file.strip_prefix(&format!("{}.", filename.to_string_lossy()))
-                            {
-                                if let Ok(suffix) = suffix_str.parse::<usize>() {
-                                    max_suffix = std::cmp::max(max_suffix, suffix);
-                                }
+
+        // This is redundant since std::fs::read_dir already check for directory
+        if !directory.is_dir() {
+            return max_suffix;
+        }
+        if let Ok(files) = std::fs::read_dir(directory) {
+            for file in files.flatten() {
+                if let Some(exist_file) = file.file_name().to_str() {
+                    if !exist_file.starts_with(filename.to_string_lossy().as_ref()) {
+                        continue;
+                    }
+                    if let Some(suffix_str) = exist_file.strip_prefix(&format!("{}.", filename.to_string_lossy())) {
+                        // Add check for compressed file also
+                        if let Some(index_num) = suffix_str.split('.').next() {
+                            if let Ok(suffix) = index_num.parse::<usize>() {
+                                max_suffix = std::cmp::max(max_suffix, suffix);
                             }
-                        }
+                        };
                     }
                 }
             }
@@ -333,6 +359,7 @@ pub struct LogRoller {
     meta: LogRollerMeta,
     state: LogRollerState,
     writer: RwLock<fs::File>,
+    compressing_handle: Option<JoinHandle<()>>,
 }
 
 impl LogRoller {
@@ -569,33 +596,37 @@ impl LogRollerMeta {
                 return Ok(());
             }
         };
+        let infile = fs::File::open(log_path).map_err(LogRollerError::FileIOError)?;
+        let reader = io::BufReader::new(infile);
+
+        let compressed_path = PathBuf::from(format!(
+            "{}.{}",
+            log_path.to_string_lossy(),
+            compression.get_extension()
+        ));
+        let outfile = fs::File::create(&compressed_path).map_err(LogRollerError::FileIOError)?;
+        let writer = io::BufWriter::new(outfile);
+
         match compression {
             Compression::Gzip => {
-                let infile = fs::File::open(log_path).map_err(LogRollerError::FileIOError)?;
-                let reader = io::BufReader::new(infile);
-
-                let compressed_path = PathBuf::from(format!(
-                    "{}.{}",
-                    log_path.to_string_lossy(),
-                    compression.get_extension()
-                ));
-                let outfile = fs::File::create(&compressed_path).map_err(LogRollerError::FileIOError)?;
-                let writer = io::BufWriter::new(outfile);
-
                 let mut encoder = GzEncoder::new(writer, flate2::Compression::default());
                 io::copy(&mut io::Read::take(reader, u64::MAX), &mut encoder)?;
                 encoder.finish()?;
-
-                // Ensures compressed file has correct permissions.
-                self.set_permissions(&compressed_path)?;
-
-                fs::remove_file(log_path).map_err(LogRollerError::FileIOError)?;
+            }
+            #[cfg(feature = "xz")]
+            Compression::XZ(level) => {
+                let mut encoder = XzEncoder::new(writer, *level);
+                io::copy(&mut io::Read::take(reader, u64::MAX), &mut encoder)?;
+                encoder.finish()?;
             } /* Compression::Bzip2
                * | Compression::LZ4
                * | Compression::Zstd
-               * | Compression::XZ
                * | Compression::Snappy => {} */
         }
+        // Ensures compressed file has correct permissions.
+        self.set_permissions(&compressed_path)?;
+
+        fs::remove_file(log_path).map_err(LogRollerError::FileIOError)?;
         Ok(())
     }
 
@@ -656,9 +687,9 @@ impl LogRollerMeta {
         new_log_path: PathBuf,
         next_size_based_index: usize,
         compression: &Option<Compression>,
-    ) -> Result<(), LogRollerError> {
+    ) -> Result<JoinHandle<()>, LogRollerError> {
         let meta = self.to_owned();
-        match &self.rotation {
+        let handle = match &self.rotation {
             Rotation::SizeBased(_) => {
                 let curr_log_path = self.directory.join(&self.filename);
 
@@ -729,7 +760,7 @@ impl LogRollerMeta {
                 }
                 *writer = new_log_file;
 
-                // 5. Process old logs asynchronously
+                // 5. Process old logs parallely
                 std::thread::spawn(move || {
                     if let Err(err) = meta.process_old_logs(&new_log_path) {
                         eprintln!(
@@ -738,7 +769,8 @@ impl LogRollerMeta {
                             err
                         );
                     }
-                });
+                    // meta.process_old_logs(&new_log_path)
+                })
             }
             Rotation::AgeBased(_) => {
                 // 1. Create the new log file first
@@ -760,7 +792,7 @@ impl LogRollerMeta {
                 // 3. Update writer with new file only after successful flush
                 *writer = new_log_file;
 
-                // 4. Process old logs asynchronously
+                // 4. Process old logs parallely
                 std::thread::spawn(move || {
                     if let Err(err) = meta.process_old_logs(&old_log_path) {
                         eprintln!(
@@ -769,10 +801,11 @@ impl LogRollerMeta {
                             err
                         );
                     }
-                });
+                    // meta.process_old_logs(&old_log_path)
+                })
             }
-        }
-        Ok(())
+        };
+        Ok(handle)
     }
 }
 
@@ -797,6 +830,7 @@ impl LogRollerMeta {
             time_zone: Local::now().offset().to_owned(),
             suffix: None,
             file_mode: None,
+            graceful_shutdown: false,
         }
     }
 
@@ -850,6 +884,9 @@ pub enum LogRollerError {
     InternalError(String),
     #[error("Failed to set file permissions for '{path}': {error}")]
     SetFilePermissionsError { path: PathBuf, error: String },
+    #[cfg(feature = "xz")]
+    #[error("Invalid XZ compression level {level}. must be 0 ≤ n ≤ 9 ")]
+    InvalidXZCompressionRate { level: u32 },
 }
 
 /// Provides a fluent interface for configuring LogRoller instances.
@@ -895,6 +932,7 @@ pub enum LogRollerError {
 ///     .time_zone(TimeZone::UTC)  // Use UTC for consistent timing
 ///     .max_keep_files(24)        // Keep one day's worth of hourly logs
 ///     .compression(Compression::Gzip)  // Compress old logs
+///     //.compression(Compression::XZ)  // Compress using XZ. Highest compression ratio but slower processing
 ///     .suffix("error".to_string())  // Name format: app.log.2025-04-01-19.error
 ///     .build()
 ///     .unwrap();
@@ -988,6 +1026,23 @@ impl LogRollerBuilder {
         }
     }
 
+    /// Determines whether the application should attempt a graceful shutdown.
+    /// When set to `true`, the application will perform cleanup operations and
+    /// allow in-progress tasks to complete before shutting down. If set to `false`,
+    /// the application may terminate immediately without waiting for ongoing tasks
+    /// such as compression thread. May cause compression corruption,
+    /// but avoids potential hangs during shutdown.
+    /// By default, this is set to `false`, meaning the application will not perform
+    /// a graceful shutdown unless explicitly enabled.
+    pub fn graceful_shutdown(self, graceful_shutdown: bool) -> Self {
+        Self {
+            meta: LogRollerMeta {
+                graceful_shutdown,
+                ..self.meta
+            },
+        }
+    }
+
     /// Build the log roller.
     pub fn build(self) -> Result<LogRoller, LogRollerError> {
         let curr_file_path = self.meta.get_curr_log_path();
@@ -995,6 +1050,14 @@ impl LogRollerBuilder {
             LogRollerState::get_next_size_based_index(&self.meta.directory, &self.meta.filename);
         if let Some(max_keep_files) = self.meta.max_keep_files {
             next_size_based_index = next_size_based_index.min(max_keep_files as usize);
+        }
+
+        // Error checking for invalid compression level.
+        #[cfg(feature = "xz")]
+        if let Some(Compression::XZ(level)) = self.meta.compression {
+            if level > 9 {
+                return Err(LogRollerError::InvalidXZCompressionRate { level });
+            }
         }
         Ok(LogRoller {
             meta: self.meta.to_owned(),
@@ -1013,6 +1076,7 @@ impl LogRollerBuilder {
                 ),
             },
             writer: RwLock::new(self.meta.create_log_file(&curr_file_path)?),
+            compressing_handle: None,
         })
     }
 }
@@ -1030,9 +1094,17 @@ impl io::Write for LogRoller {
         let bytes = writer.write(buf)?;
         self.state.curr_file_size_bytes += bytes as u64;
 
+        // Check if compression thread still running. if it is, store log into previos buffer first.
+        if let Some(handle) = &self.compressing_handle {
+            if !handle.is_finished() {
+                return Ok(bytes);
+            }
+        };
+
         // Check if we need to rollover the log file
         if let Some(new_log_path) = Self::should_rollover(&self.meta, &self.state) {
-            self.meta
+            let handle = self
+                .meta
                 .refresh_writer(
                     writer,
                     old_log_path,
@@ -1041,6 +1113,7 @@ impl io::Write for LogRoller {
                     &compression,
                 )
                 .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+            self.compressing_handle = Some(handle);
             self.state.curr_file_path.clone_from(&new_log_path);
 
             match &self.meta.rotation {
@@ -1066,7 +1139,17 @@ impl io::Write for LogRoller {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.writer.get_mut().unwrap_or_else(PoisonError::into_inner).flush()
+        self.writer.get_mut().unwrap_or_else(PoisonError::into_inner).flush()?;
+
+        //Skips waiting for thread to finish if graceful_shutdown == false
+        if !self.meta.graceful_shutdown {
+            return Ok(());
+        }
+
+        if let Some(handle) = self.compressing_handle.take() {
+            let _ = handle.join();
+        }
+        Ok(())
     }
 }
 
