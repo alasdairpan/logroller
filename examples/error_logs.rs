@@ -16,10 +16,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for error_code in &[500, 502, 503, 504] {
         writeln!(
             error_logger,
-            "Error {}: Server encountered an internal error, please try again later",
-            error_code
+            "Error {error_code}: Server encountered an internal error, please try again later",
         )?;
-        writeln!(error_logger, "Stack trace for error {}:", error_code)?;
+        writeln!(error_logger, "Stack trace for error {error_code}:")?;
         writeln!(error_logger, "  at processRequest (server.rs:42)")?;
         writeln!(error_logger, "  at handleConnection (network.rs:121)")?;
         writeln!(error_logger, "  at main (main.rs:15)")?;

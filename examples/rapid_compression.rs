@@ -1,9 +1,7 @@
-
 /// This is simulatin if there are lost of data during compression.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    
     #[cfg(feature = "xz")]
-    {   
+    {
         let start = Instant::now();
         use {
             logroller::{LogRollerBuilder, Rotation, RotationSize},
@@ -20,19 +18,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for i in 1..=10_000 {
             writeln!(
                 logger,
-                "Log entry #{}: This is a sample log message that will contribute to file size",
-                i
+                "Log entry #{i}: This is a sample log message that will contribute to file size"
             )?;
         }
         logger.flush()?;
         println!("Done logging: {:?}", start.elapsed());
     }
-    
+
     #[cfg(not(feature = "xz"))]
     {
         println!("XZ compression example skipped. Enable 'xz' feature to run XZ compression example.");
         println!("Run with: cargo run --example rapid_compression --features xz");
     }
-    
+
     Ok(())
 }

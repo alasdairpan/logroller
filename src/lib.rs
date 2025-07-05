@@ -126,7 +126,6 @@ impl RotationSize {
 /// * Bzip2 - Higher compression ratio but slower than Gzip
 /// * LZ4 - Fast compression with good compression ratio
 /// * Zstd - Modern algorithm balancing speed and compression
-/// * XZ - Highest compression ratio but slower processing
 /// * Snappy - Very fast compression, developed by Google
 #[derive(Debug, Clone)]
 pub enum Compression {
@@ -138,14 +137,15 @@ pub enum Compression {
     // Zstd,
     /// XZ compression.
     ///
-    /// Offers the highest compression ratio but significantly slower processing speed.
-    /// Accepts a compression level from `0` to `9`:
+    /// Offers the highest compression ratio but significantly slower processing
+    /// speed. Accepts a compression level from `0` to `9`:
     /// - `0`: Minimal compression, fastest speed, smallest memory usage.
     /// - `9`: Maximum compression, slowest speed, highest memory usage.
     ///
     /// Higher compression levels require larger dictionary sizes and more RAM.
-    /// Ensure that the compression level is within the valid range to avoid runtime errors.
-    /// 
+    /// Ensure that the compression level is within the valid range to avoid
+    /// runtime errors.
+    ///
     /// **Note:** Requires the `xz` feature to be enabled.
     #[cfg(feature = "xz")]
     XZ(u32),
@@ -488,16 +488,17 @@ impl LogRollerMeta {
     /// Process old log files.
     fn process_old_logs(&self, log_path: &PathBuf) -> Result<(), LogRollerError> {
         self.compress(log_path)?;
-        let all_log_files = Self::list_all_files(
-            &self.directory,
-            self.filename.as_path().as_os_str().to_string_lossy().as_ref(),
-            &self.rotation,
-            &self.suffix,
-            &self.compression,
-        )?;
 
         // Remove old log files if necessary
         if let Some(max_keep_files) = self.max_keep_files {
+            let all_log_files = Self::list_all_files(
+                &self.directory,
+                self.filename.as_path().as_os_str().to_string_lossy().as_ref(),
+                &self.rotation,
+                &self.suffix,
+                &self.compression,
+            )?;
+
             match &self.rotation {
                 Rotation::SizeBased(_) => {
                     for file in all_log_files {
@@ -755,12 +756,12 @@ impl LogRollerMeta {
 
                 // 4. Only update writer after successful file creation
                 if let Err(err) = writer.flush() {
-                    eprintln!("Failed to flush writer: {}", err);
+                    eprintln!("Failed to flush writer: {err}");
                     return Err(LogRollerError::FileIOError(err));
                 }
                 *writer = new_log_file;
 
-                // 5. Process old logs parallely
+                // 5. Process old logs in a separate thread (sequentially)
                 std::thread::spawn(move || {
                     if let Err(err) = meta.process_old_logs(&new_log_path) {
                         eprintln!(
@@ -769,7 +770,6 @@ impl LogRollerMeta {
                             err
                         );
                     }
-                    // meta.process_old_logs(&new_log_path)
                 })
             }
             Rotation::AgeBased(_) => {
@@ -792,7 +792,7 @@ impl LogRollerMeta {
                 // 3. Update writer with new file only after successful flush
                 *writer = new_log_file;
 
-                // 4. Process old logs parallely
+                // 4. Process old logs in a separate thread (sequentially)
                 std::thread::spawn(move || {
                     if let Err(err) = meta.process_old_logs(&old_log_path) {
                         eprintln!(
@@ -801,7 +801,6 @@ impl LogRollerMeta {
                             err
                         );
                     }
-                    // meta.process_old_logs(&old_log_path)
                 })
             }
         };
@@ -841,7 +840,7 @@ impl LogRollerMeta {
                 .format(&format!("{}.{pattern}", self.filename.as_path().to_string_lossy()))
                 .to_string();
             if let Some(suffix) = &self.suffix {
-                tf = format!("{}.{}", tf, suffix);
+                tf = format!("{tf}.{suffix}");
             }
             self.directory.join(PathBuf::from(tf))
         };
@@ -885,8 +884,8 @@ pub enum LogRollerError {
     #[error("Failed to set file permissions for '{path}': {error}")]
     SetFilePermissionsError { path: PathBuf, error: String },
     #[cfg(feature = "xz")]
-    #[error("Invalid XZ compression level {level}. must be 0 ≤ n ≤ 9 ")]
-    InvalidXZCompressionRate { level: u32 },
+    #[error("Invalid XZ compression level {level}. Must be 0 ≤ n ≤ 9")]
+    InvalidXZCompressionLevel { level: u32 },
 }
 
 /// Provides a fluent interface for configuring LogRoller instances.
@@ -932,7 +931,7 @@ pub enum LogRollerError {
 ///     .time_zone(TimeZone::UTC)  // Use UTC for consistent timing
 ///     .max_keep_files(24)        // Keep one day's worth of hourly logs
 ///     .compression(Compression::Gzip)  // Compress old logs
-///     //.compression(Compression::XZ)  // Compress using XZ. Highest compression ratio but slower processing
+///     // .compression(Compression::XZ(6))  // Compress using XZ. Requires `xz` feature.
 ///     .suffix("error".to_string())  // Name format: app.log.2025-04-01-19.error
 ///     .build()
 ///     .unwrap();
@@ -1028,12 +1027,17 @@ impl LogRollerBuilder {
 
     /// Determines whether the application should attempt a graceful shutdown.
     /// When set to `true`, the application will perform cleanup operations and
-    /// allow in-progress tasks to complete before shutting down. If set to `false`,
-    /// the application may terminate immediately without waiting for ongoing tasks
-    /// such as compression thread. May cause compression corruption,
-    /// but avoids potential hangs during shutdown.
-    /// By default, this is set to `false`, meaning the application will not perform
-    /// a graceful shutdown unless explicitly enabled.
+    /// allow in-progress tasks (like file compression and old file cleanup) to
+    /// complete before shutting down. If set to `false`, the application may
+    /// terminate immediately without waiting for these ongoing tasks.
+    ///
+    /// **Compression Corruption Risk**: If `graceful_shutdown` is `false` and
+    /// the application exits while a compression thread is still writing a
+    /// compressed file, the resulting file may be incomplete or corrupted.
+    /// Setting this to `true` ensures that all compression operations
+    /// finish, but may cause a slight delay during application shutdown.
+    ///
+    /// By default, this is set to `false`.
     pub fn graceful_shutdown(self, graceful_shutdown: bool) -> Self {
         Self {
             meta: LogRollerMeta {
@@ -1056,7 +1060,7 @@ impl LogRollerBuilder {
         #[cfg(feature = "xz")]
         if let Some(Compression::XZ(level)) = self.meta.compression {
             if level > 9 {
-                return Err(LogRollerError::InvalidXZCompressionRate { level });
+                return Err(LogRollerError::InvalidXZCompressionLevel { level });
             }
         }
         Ok(LogRoller {
@@ -1094,7 +1098,8 @@ impl io::Write for LogRoller {
         let bytes = writer.write(buf)?;
         self.state.curr_file_size_bytes += bytes as u64;
 
-        // Check if compression thread still running. if it is, store log into previos buffer first.
+        // Check if compression thread still running. if it is, store log into previos
+        // buffer first.
         if let Some(handle) = &self.compressing_handle {
             if !handle.is_finished() {
                 return Ok(bytes);
@@ -1141,7 +1146,7 @@ impl io::Write for LogRoller {
     fn flush(&mut self) -> io::Result<()> {
         self.writer.get_mut().unwrap_or_else(PoisonError::into_inner).flush()?;
 
-        //Skips waiting for thread to finish if graceful_shutdown == false
+        // Skips waiting for thread to finish if graceful_shutdown == false
         if !self.meta.graceful_shutdown {
             return Ok(());
         }
