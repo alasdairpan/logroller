@@ -1,5 +1,5 @@
 [package]
-authors = ["Trayvon Pan <trayvonpan@gmail.com>"]
+authors = ["Alasdair Pan <alasdairpan@gmail.com>"]
 categories = ["development-tools::debugging"]
 description = "A feature-rich log rotation library with timezone support, flexible rotation strategies, and compression, integrating seamlessly with the tracing ecosystem."
 documentation = "https://docs.rs/logroller/"
@@ -8,7 +8,7 @@ keywords = ["logging", "tracing", "tracing-appender"]
 license = "MIT"
 name = "logroller"
 readme = "README.md"
-repository = "https://github.com/trayvonpan/logroller/"
+repository = "https://github.com/alasdairpan/logroller/"
 version = "0.1.10"
 
 [workspace.dependencies]
