@@ -572,12 +572,12 @@ impl LogRollerMeta {
 
         let mut all_log_files = Vec::new();
         for file in files.flatten() {
-            let metadata = file.metadata().map_err(LogRollerError::FileIOError)?;
-            if !metadata.is_file() {
-                continue;
-            }
             if let Some(file_name) = file.file_name().to_str() {
                 if file_pattern.is_match(file_name) {
+                    let metadata = file.metadata().map_err(LogRollerError::FileIOError)?;
+                    if !metadata.is_file() {
+                        continue;
+                    }
                     all_log_files.push(file);
                 }
             }
