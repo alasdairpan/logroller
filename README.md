@@ -212,7 +212,6 @@ let mut logger = LogRollerBuilder::new("./logs", "graceful.log")
 - When `graceful_shutdown` is `false` (default), `flush()` returns immediately without waiting
 - Setting to `false` prevents potential hangs during shutdown but may cause compression corruption
 
-
 ## Performance Considerations 🚀
 
 - Use `tracing-appender::non_blocking` for non-blocking log writes

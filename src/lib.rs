@@ -371,13 +371,14 @@ impl LogRoller {
     /// # Arguments
     /// * `meta` - The metadata for the log roller.
     /// * `state` - The state for the log roller.
+    /// * `pending_bytes` - The number of bytes about to be written.
     /// # Returns
     /// The path to the new log file if the log file should be rolled over,
     /// otherwise None.
-    fn should_rollover(meta: &LogRollerMeta, state: &LogRollerState) -> Option<PathBuf> {
+    fn should_rollover(meta: &LogRollerMeta, state: &LogRollerState, pending_bytes: u64) -> Option<PathBuf> {
         match &meta.rotation {
             Rotation::SizeBased(rotation_size) => {
-                if state.curr_file_size_bytes >= rotation_size.bytes() {
+                if state.curr_file_size_bytes + pending_bytes >= rotation_size.bytes() {
                     return Some(meta.directory.join(PathBuf::from(
                         format!("{}.1", meta.filename.as_path().to_string_lossy(),).to_string(),
                     )));
@@ -1094,52 +1095,54 @@ impl io::Write for LogRoller {
         let next_size_based_index = self.state.next_size_based_index;
         let compression = self.meta.compression.to_owned();
 
-        // Write the log data to the current file
-        let bytes = writer.write(buf)?;
-        self.state.curr_file_size_bytes += bytes as u64;
+        // If compression thread still running, skip rotation check and write directly.
+        let compressing = self
+            .compressing_handle
+            .as_ref()
+            .is_some_and(|h| !h.is_finished());
 
-        // Check if compression thread still running. if it is, store log into previos
-        // buffer first.
-        if let Some(handle) = &self.compressing_handle {
-            if !handle.is_finished() {
-                return Ok(bytes);
-            }
-        };
+        // Check rotation before writing so log entries always land in the
+        // correct time/size-bound file.
+        if !compressing {
+            if let Some(new_log_path) =
+                Self::should_rollover(&self.meta, &self.state, buf.len() as u64)
+            {
+                let handle = self
+                    .meta
+                    .refresh_writer(
+                        writer,
+                        old_log_path,
+                        new_log_path.to_owned(),
+                        next_size_based_index,
+                        &compression,
+                    )
+                    .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+                self.compressing_handle = Some(handle);
+                self.state.curr_file_path.clone_from(&new_log_path);
 
-        // Check if we need to rollover the log file
-        if let Some(new_log_path) = Self::should_rollover(&self.meta, &self.state) {
-            let handle = self
-                .meta
-                .refresh_writer(
-                    writer,
-                    old_log_path,
-                    new_log_path.to_owned(),
-                    next_size_based_index,
-                    &compression,
-                )
-                .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
-            self.compressing_handle = Some(handle);
-            self.state.curr_file_path.clone_from(&new_log_path);
-
-            match &self.meta.rotation {
-                Rotation::SizeBased(_) => {
-                    self.state.curr_file_size_bytes = 0;
-                    self.state.next_size_based_index += 1;
-                    // If max_keep_files is set, the next_size_based_index should not exceed it
-                    if let Some(max_keep_files) = self.meta.max_keep_files {
-                        self.state.next_size_based_index =
-                            self.state.next_size_based_index.min(max_keep_files as usize);
+                match &self.meta.rotation {
+                    Rotation::SizeBased(_) => {
+                        self.state.curr_file_size_bytes = 0;
+                        self.state.next_size_based_index += 1;
+                        if let Some(max_keep_files) = self.meta.max_keep_files {
+                            self.state.next_size_based_index =
+                                self.state.next_size_based_index.min(max_keep_files as usize);
+                        }
                     }
-                }
-                Rotation::AgeBased(rotation_age) => {
-                    self.state.curr_file_size_bytes = 0;
-                    self.state.next_age_based_time = self
-                        .meta
-                        .next_time(self.meta.now(), rotation_age.to_owned())
-                        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+                    Rotation::AgeBased(rotation_age) => {
+                        self.state.curr_file_size_bytes = 0;
+                        self.state.next_age_based_time = self
+                            .meta
+                            .next_time(self.meta.now(), rotation_age.to_owned())
+                            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+                    }
                 }
             }
         }
+
+        // Write to the (possibly new) current file
+        let bytes = writer.write(buf)?;
+        self.state.curr_file_size_bytes += bytes as u64;
         Ok(bytes)
     }
 
