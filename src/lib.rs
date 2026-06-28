@@ -633,7 +633,7 @@ impl LogRollerMeta {
                     if processed.len() > max_keep_files as usize {
                         for file in processed.iter().take(processed.len() - max_keep_files as usize) {
                             let path = file.path();
-                            if let Err(err) = fs::remove_file(&path) {
+                            if let Err(err) = Self::remove_file_if_exists(&path) {
                                 eprintln!("Failed to remove old log file '{}': {}", path.display(), err);
                             }
                         }
@@ -656,6 +656,15 @@ impl LogRollerMeta {
 
         let mut all_log_files = Vec::new();
         for file in files.flatten() {
+            // Check the cheap regex match first — only call metadata()
+            // (a filesystem syscall) on entries that match the pattern.
+            if file
+                .file_name()
+                .to_str()
+                .map_or(true, |name| !file_pattern.is_match(name))
+            {
+                continue;
+            }
             let metadata = match file.metadata() {
                 Ok(metadata) => metadata,
                 Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
@@ -664,11 +673,7 @@ impl LogRollerMeta {
             if !metadata.is_file() {
                 continue;
             }
-            if let Some(file_name) = file.file_name().to_str() {
-                if file_pattern.is_match(file_name) {
-                    all_log_files.push(file);
-                }
-            }
+            all_log_files.push(file);
         }
 
         all_log_files.sort_by_key(|f| f.file_name());
@@ -718,7 +723,7 @@ impl LogRollerMeta {
             compression.get_extension()
         ));
         self.compress_to_path(log_path, &compressed_path)?;
-        fs::remove_file(log_path).map_err(LogRollerError::FileIOError)?;
+        Self::remove_file_if_exists(log_path)?;
         Ok(())
     }
 
@@ -732,6 +737,15 @@ impl LogRollerMeta {
                 to: to.to_path_buf(),
                 error: err.to_string(),
             }),
+        }
+    }
+
+    /// Remove `path` if it exists. Otherwise do nothing.
+    fn remove_file_if_exists(path: &Path) -> Result<(), LogRollerError> {
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(LogRollerError::FileIOError(err)),
         }
     }
 
@@ -837,7 +851,7 @@ impl LogRollerMeta {
             {
                 if index > max_keep_files as usize {
                     let path = file.path();
-                    if let Err(err) = fs::remove_file(&path) {
+                    if let Err(err) = Self::remove_file_if_exists(&path) {
                         eprintln!("Failed to remove old log file '{}': {}", path.display(), err);
                     }
                 }
@@ -854,7 +868,6 @@ impl LogRollerMeta {
             Some(compression) => {
                 let compressed_pending_path = self.get_size_based_compression_temp_path(pending_log_path, compression);
                 self.compress_to_path(pending_log_path, &compressed_pending_path)?;
-                fs::remove_file(pending_log_path).map_err(LogRollerError::FileIOError)?;
 
                 self.shift_size_based_archives()?;
 
@@ -864,6 +877,11 @@ impl LogRollerMeta {
                     to: target_path.clone(),
                     error: err.to_string(),
                 })?;
+
+                // Only delete the pending file after the archive rename
+                // has succeeded — keeps the data recoverable if the shift
+                // or rename fails.
+                Self::remove_file_if_exists(pending_log_path)?;
             }
             None => {
                 self.shift_size_based_archives()?;
@@ -1363,7 +1381,7 @@ impl io::Write for LogRoller {
         }
 
         self.writer.write_all(buf)?;
-        self.state.curr_file_size_bytes += buf.len() as u64;
+        self.state.curr_file_size_bytes = self.state.curr_file_size_bytes.saturating_add(buf.len() as u64);
         Ok(buf.len())
     }
 
