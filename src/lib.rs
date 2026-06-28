@@ -53,7 +53,7 @@ use {
         fs::{self, DirEntry, Permissions},
         io::{self, Write as _},
         path::{Path, PathBuf},
-        sync::{PoisonError, RwLock},
+        sync::mpsc,
         thread::JoinHandle,
     },
 };
@@ -63,6 +63,64 @@ use xz2::write::XzEncoder;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+
+/// A job sent to the background worker after each rotation.
+///
+/// Carries the path of the old log file and a clone of the metadata so the
+/// worker can compress, shift, and prune independently of the write path.
+struct PostRotationJob {
+    /// Path of the rotated-out log file that needs processing.
+    log_path: PathBuf,
+    /// Snapshot of the configuration at rotation time.
+    meta: LogRollerMeta,
+}
+
+/// Extract a human-readable message from a thread panic payload.
+fn join_error_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+    match payload.downcast::<String>() {
+        Ok(message) => *message,
+        Err(payload) => match payload.downcast::<&'static str>() {
+            Ok(message) => (*message).to_string(),
+            Err(_) => "unknown panic payload".to_string(),
+        },
+    }
+}
+
+/// Background worker that processes [`PostRotationJob`]s.
+///
+/// Waits for jobs on the channel receiver. When a job arrives, it calls
+/// `process_old_logs`, then drains any accumulated backlog before going back
+/// to waiting. Exits after an idle timeout of 5 seconds or when the channel
+/// is disconnected.
+fn run_rotation_worker(rx: mpsc::Receiver<PostRotationJob>) {
+    const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    loop {
+        match rx.recv_timeout(IDLE_TIMEOUT) {
+            Ok(job) => {
+                if let Err(err) = job.meta.process_old_logs(&job.log_path) {
+                    eprintln!(
+                        "Failed to process old log files for '{}': {}",
+                        job.log_path.display(),
+                        err
+                    );
+                }
+                // Drain any backlog that piled up while we were working.
+                while let Ok(job) = rx.try_recv() {
+                    if let Err(err) = job.meta.process_old_logs(&job.log_path) {
+                        eprintln!(
+                            "Failed to process old log files for '{}': {}",
+                            job.log_path.display(),
+                            err
+                        );
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
 
 /// Defines size thresholds for rotating log files in various units.
 ///
@@ -283,13 +341,20 @@ struct LogRollerMeta {
     file_mode: Option<u32>,
     /// Waits for both compression and old file cleanup during shutdown.
     graceful_shutdown: bool,
+    /// Pre-compiled regex that matches archive file names for the current
+    /// rotation strategy. Computed once during build.
+    file_pattern: Option<Regex>,
 }
 
 /// State for the log roller.
 /// This struct is used to keep track of the current state of the log roller.
 struct LogRollerState {
-    /// The next index for size-based rotation.
-    next_size_based_index: usize,
+    /// Monotonically increasing counter giving each pending size-based
+    /// rotation a unique identity in the `{filename}.pending.{N}` namespace.
+    /// This lets us rotate while a previous compression is still running
+    /// — the pending file name is stable and won't be clobbered by a
+    /// subsequent rotation's index-shifting dance.
+    next_pending_sequence: u64,
     /// The next time for age-based rotation.
     next_age_based_time: DateTime<FixedOffset>,
     /// The current file path.
@@ -299,42 +364,34 @@ struct LogRollerState {
 }
 
 impl LogRollerState {
-    /// Get the next size-based index for the log file.
-    /// This function will scan the directory for existing log files with the
-    /// same name and return the next index based on the existing files.
-    /// If no existing files are found, the index will be set to 1.
-    /// The index is used to create a new log file with the same name but a
-    /// different index. For example, if the log file is `app.log`, the next
-    /// log file will be `app.log.1`. If the log file is `app.log.1`, the
-    /// next log file will be `app.log.2`, and so on. The index is
-    /// incremented each time a new log file is created.
-    /// Same goes for compressed file `app.log.1.gz`, the next log file will
-    /// be `app.log.2.gz`
+    /// Get the next pending sequence for size-based rotation.
+    /// This function will scan the directory for existing pending log files
+    /// with the same name and return the next sequence number based on the
+    /// existing files. If no existing pending files are found, the sequence
+    /// will be set to 0.
+    /// Pending files use the format `{filename}.pending.{N}` and are a
+    /// temporary identity for queued post-rotation work. The worker later
+    /// publishes them into the public numbered archive namespace.
     /// # Arguments
     /// * `directory` - The directory where the log files are stored.
     /// * `filename` - The name of the log file.
     /// # Returns
-    /// The next size-based index for the log file.
-    fn get_next_size_based_index(directory: &PathBuf, filename: &Path) -> usize {
-        let mut max_suffix = 0;
+    /// The next pending sequence number for the log file.
+    fn get_next_pending_sequence(directory: &PathBuf, filename: &Path) -> u64 {
+        let mut max_suffix: u64 = 0;
 
         // This is redundant since std::fs::read_dir already check for directory
         if !directory.is_dir() {
             return max_suffix;
         }
+        let prefix = format!("{}.pending.", filename.to_string_lossy());
         if let Ok(files) = std::fs::read_dir(directory) {
             for file in files.flatten() {
-                if let Some(exist_file) = file.file_name().to_str() {
-                    if !exist_file.starts_with(filename.to_string_lossy().as_ref()) {
-                        continue;
-                    }
-                    if let Some(suffix_str) = exist_file.strip_prefix(&format!("{}.", filename.to_string_lossy())) {
-                        // Add check for compressed file also
-                        if let Some(index_num) = suffix_str.split('.').next() {
-                            if let Ok(suffix) = index_num.parse::<usize>() {
-                                max_suffix = std::cmp::max(max_suffix, suffix);
-                            }
-                        };
+                if let Some(name) = file.file_name().to_str() {
+                    if let Some(suffix_str) = name.strip_prefix(&prefix) {
+                        if let Ok(suffix) = suffix_str.parse::<u64>() {
+                            max_suffix = std::cmp::max(max_suffix, suffix);
+                        }
                     }
                 }
             }
@@ -356,29 +413,32 @@ impl LogRollerState {
 
 /// A log roller that rolls over logs based on size or age.
 pub struct LogRoller {
+    /// Immutable configuration (cheaply cloned for the worker).
     meta: LogRollerMeta,
+    /// Mutable runtime state — current file path, size, next rotation time.
     state: LogRollerState,
-    writer: RwLock<fs::File>,
-    compressing_handle: Option<JoinHandle<()>>,
+    /// The active log file.
+    writer: fs::File,
+    /// Sender half of the post-rotation channel. Dropping this signals the
+    /// worker to drain and exit.
+    worker_tx: Option<mpsc::Sender<PostRotationJob>>,
+    /// Handle to the post-rotation background thread (spawned lazily).
+    worker_handle: Option<JoinHandle<()>>,
 }
 
 impl LogRoller {
-    /// Check if the log file should be rolled over.
-    /// This function will check if the log file should be rolled over based on
-    /// the rotation type. If the log file should be rolled over, the
-    /// function will return the path to the new log file. If the log file
-    /// should not be rolled over, the function will return None.
-    /// # Arguments
-    /// * `meta` - The metadata for the log roller.
-    /// * `state` - The state for the log roller.
-    /// * `pending_bytes` - The number of bytes about to be written.
-    /// # Returns
-    /// The path to the new log file if the log file should be rolled over,
-    /// otherwise None.
+    /// Decide whether the current log file should be rotated.
+    ///
+    /// For size-based rotation this compares `current_size + pending_bytes`
+    /// against the threshold. For age-based rotation it checks whether the
+    /// current time has passed the next scheduled rotation boundary.
+    ///
+    /// Returns `Some(new_log_path)` if rotation is needed, or `None` otherwise.
+    #[inline]
     fn should_rollover(meta: &LogRollerMeta, state: &LogRollerState, pending_bytes: u64) -> Option<PathBuf> {
         match &meta.rotation {
             Rotation::SizeBased(rotation_size) => {
-                if state.curr_file_size_bytes + pending_bytes >= rotation_size.bytes() {
+                if state.curr_file_size_bytes.saturating_add(pending_bytes) >= rotation_size.bytes() {
                     return Some(meta.directory.join(PathBuf::from(
                         format!("{}.1", meta.filename.as_path().to_string_lossy(),).to_string(),
                     )));
@@ -393,6 +453,60 @@ impl LogRoller {
             }
         }
         None
+    }
+
+    /// Submit a [`PostRotationJob`] to the background worker.
+    ///
+    /// If no worker is running (first rotation), one is spawned. If the worker
+    /// has exited (idle timeout), the old thread is reaped and a new one
+    /// started. The job is re-submitted so it is never silently dropped.
+    fn post_rotation(&mut self, log_path: PathBuf) {
+        let meta = self.meta.clone();
+
+        if let Some(tx) = self.worker_tx.take() {
+            match tx.send(PostRotationJob { log_path, meta }) {
+                Ok(()) => {
+                    self.worker_tx = Some(tx);
+                }
+                Err(mpsc::SendError(job)) => {
+                    // Worker exited — reap it.
+                    Self::join_worker(&mut self.worker_handle, "worker restart");
+                    // Spawn a fresh worker and retry with the recovered job.
+                    let (tx, rx) = mpsc::channel();
+                    self.worker_handle = Some(std::thread::spawn(move || run_rotation_worker(rx)));
+                    self.worker_tx = Some(tx.clone());
+                    if let Err(mpsc::SendError(job)) = tx.send(job) {
+                        eprintln!(
+                            "Failed to resubmit post-rotation job for '{}' after restarting worker",
+                            job.log_path.display()
+                        );
+                    }
+                }
+            }
+        } else {
+            // First rotation — spawn the worker.
+            let (tx, rx) = mpsc::channel();
+            self.worker_handle = Some(std::thread::spawn(move || run_rotation_worker(rx)));
+            self.worker_tx = Some(tx.clone());
+            if let Err(mpsc::SendError(job)) = tx.send(PostRotationJob { log_path, meta }) {
+                eprintln!(
+                    "Failed to submit post-rotation job for '{}' to a newly spawned worker",
+                    job.log_path.display()
+                );
+            }
+        }
+    }
+
+    /// Join the worker thread, logging any panic with a context label.
+    fn join_worker(handle: &mut Option<JoinHandle<()>>, context: &str) {
+        if let Some(h) = handle.take() {
+            if let Err(err) = h.join() {
+                eprintln!(
+                    "Rotation worker panicked during {context}: {}",
+                    join_error_to_string(err)
+                );
+            }
+        }
     }
 }
 
@@ -486,49 +600,38 @@ impl LogRollerMeta {
         Ok(log_file)
     }
 
-    /// Process old log files.
+    /// Entry point for all post-rotation work. Dispatches on rotation strategy:
+    /// size-based → publish into numbered archive namespace; age-based →
+    /// compress the old file and prune excess archives.
     fn process_old_logs(&self, log_path: &PathBuf) -> Result<(), LogRollerError> {
-        self.compress(log_path)?;
+        match &self.rotation {
+            Rotation::SizeBased(_) => self.publish_size_based_log(log_path),
+            Rotation::AgeBased(_) => {
+                self.compress(log_path)?;
 
-        // Remove old log files if necessary
-        if let Some(max_keep_files) = self.max_keep_files {
-            let all_log_files = Self::list_all_files(
-                &self.directory,
-                self.filename.as_path().as_os_str().to_string_lossy().as_ref(),
-                &self.rotation,
-                &self.suffix,
-                &self.compression,
-            )?;
+                if let Some(max_keep_files) = self.max_keep_files {
+                    let all_log_files = Self::list_all_files(
+                        &self.directory,
+                        self.file_pattern.as_ref().expect("file_pattern not initialized"),
+                    )?;
 
-            match &self.rotation {
-                Rotation::SizeBased(_) => {
-                    for file in all_log_files {
-                        if let Some(index) = file
-                            .path()
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .and_then(|s| {
-                                let mut parts = s.split('.').collect::<Vec<&str>>();
-                                if self.compression.is_some() {
-                                    // Remove the compression extension
-                                    parts.pop();
-                                }
-                                parts.last().cloned()
+                    // Only prune fully-processed files. If compression is
+                    // enabled, uncompressed files are still in the worker
+                    // queue (or are the active file) and must not be counted.
+                    let processed: Vec<_> = match &self.compression {
+                        Some(c) => all_log_files
+                            .iter()
+                            .filter(|f| {
+                                f.file_name()
+                                    .to_string_lossy()
+                                    .ends_with(&format!(".{}", c.get_extension()))
                             })
-                            .and_then(|s| s.parse::<usize>().ok())
-                        {
-                            if index >= max_keep_files as usize {
-                                let path = file.path();
-                                if let Err(err) = fs::remove_file(&path) {
-                                    eprintln!("Failed to remove old log file '{}': {}", path.display(), err);
-                                }
-                            }
-                        }
-                    }
-                }
-                Rotation::AgeBased(_) => {
-                    if all_log_files.len() > max_keep_files as usize {
-                        for file in all_log_files.iter().take(all_log_files.len() - max_keep_files as usize) {
+                            .collect(),
+                        None => all_log_files.iter().collect(),
+                    };
+
+                    if processed.len() > max_keep_files as usize {
+                        for file in processed.iter().take(processed.len() - max_keep_files as usize) {
                             let path = file.path();
                             if let Err(err) = fs::remove_file(&path) {
                                 eprintln!("Failed to remove old log file '{}': {}", path.display(), err);
@@ -536,100 +639,240 @@ impl LogRollerMeta {
                         }
                     }
                 }
+                Ok(())
             }
         }
-
-        Ok(())
     }
 
     /// List all log files in the directory.
-    fn list_all_files(
-        directory: &PathBuf,
-        filename: &str,
-        rotation: &Rotation,
-        file_suffix: &Option<String>,
-        compression: &Option<Compression>,
-    ) -> Result<Vec<DirEntry>, LogRollerError> {
-        let file_suffix = file_suffix.clone().map(|s| format!("(.{s})?")).unwrap_or_default();
-        let compression_suffix = compression
-            .clone()
-            .map(|c| format!("(.{})?", c.get_extension()))
-            .unwrap_or_default();
-        let file_pattern = match rotation {
-            Rotation::SizeBased(_) => Regex::new(&format!(r"^{filename}(\.\d+)?{file_suffix}{compression_suffix}$"))
-                .map_err(|err| LogRollerError::InternalError(err.to_string()))?,
-            Rotation::AgeBased(rotation_age) => {
-                let pattern = match rotation_age {
-                    RotationAge::Minutely => r"\d{4}-\d{2}-\d{2}-\d{2}-\d{2}",
-                    RotationAge::Hourly => r"\d{4}-\d{2}-\d{2}-\d{2}",
-                    RotationAge::Daily => r"\d{4}-\d{2}-\d{2}",
-                };
-                Regex::new(&format!(r"^{filename}\.{pattern}{file_suffix}{compression_suffix}$"))
-                    .map_err(|err| LogRollerError::InternalError(err.to_string()))?
-            }
+    /// List all log files in the directory matching `file_pattern`.
+    /// Results are sorted alphabetically by file name.
+    fn list_all_files(directory: &PathBuf, file_pattern: &Regex) -> Result<Vec<DirEntry>, LogRollerError> {
+        let files = match fs::read_dir(directory) {
+            Ok(files) => files,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(LogRollerError::InternalError(err.to_string())),
         };
-
-        let files = fs::read_dir(directory).map_err(|err| LogRollerError::InternalError(err.to_string()))?;
 
         let mut all_log_files = Vec::new();
         for file in files.flatten() {
+            let metadata = match file.metadata() {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(LogRollerError::FileIOError(err)),
+            };
+            if !metadata.is_file() {
+                continue;
+            }
             if let Some(file_name) = file.file_name().to_str() {
                 if file_pattern.is_match(file_name) {
-                    let metadata = file.metadata().map_err(LogRollerError::FileIOError)?;
-                    if !metadata.is_file() {
-                        continue;
-                    }
                     all_log_files.push(file);
                 }
             }
         }
 
-        // Sort the log files by name
         all_log_files.sort_by_key(|f| f.file_name());
-
         Ok(all_log_files)
     }
 
-    /// Compress the log file.
-    fn compress(&self, log_path: &PathBuf) -> Result<(), LogRollerError> {
+    /// Compress the contents of `log_path` and write them to `compressed_path`.
+    /// The original file is left in place; the caller is responsible for
+    /// removing it if desired.
+    fn compress_to_path(&self, log_path: &Path, compressed_path: &Path) -> Result<(), LogRollerError> {
         let compression = match &self.compression {
             Some(compression) => compression,
-            None => {
-                return Ok(());
-            }
+            None => return Ok(()),
         };
         let infile = fs::File::open(log_path).map_err(LogRollerError::FileIOError)?;
-        let reader = io::BufReader::new(infile);
-
-        let compressed_path = PathBuf::from(format!(
-            "{}.{}",
-            log_path.to_string_lossy(),
-            compression.get_extension()
-        ));
-        let outfile = fs::File::create(&compressed_path).map_err(LogRollerError::FileIOError)?;
-        let writer = io::BufWriter::new(outfile);
+        let mut reader = io::BufReader::new(infile);
+        let outfile = fs::File::create(compressed_path).map_err(LogRollerError::FileIOError)?;
+        let writer = outfile;
 
         match compression {
             Compression::Gzip => {
                 let mut encoder = GzEncoder::new(writer, flate2::Compression::default());
-                io::copy(&mut io::Read::take(reader, u64::MAX), &mut encoder)?;
+                io::copy(&mut reader, &mut encoder)?;
                 encoder.finish()?;
             }
             #[cfg(feature = "xz")]
             Compression::XZ(level) => {
                 let mut encoder = XzEncoder::new(writer, *level);
-                io::copy(&mut io::Read::take(reader, u64::MAX), &mut encoder)?;
+                io::copy(&mut reader, &mut encoder)?;
                 encoder.finish()?;
-            } /* Compression::Bzip2
-               * | Compression::LZ4
-               * | Compression::Zstd
-               * | Compression::Snappy => {} */
+            }
         }
-        // Ensures compressed file has correct permissions.
-        self.set_permissions(&compressed_path)?;
+        self.set_permissions(compressed_path)?;
+        Ok(())
+    }
 
+    /// Compress `log_path` in-place: write a compressed sibling, then remove
+    /// the original. Used for age-based rotation.
+    fn compress(&self, log_path: &PathBuf) -> Result<(), LogRollerError> {
+        let compression = match &self.compression {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+        let compressed_path = PathBuf::from(format!(
+            "{}.{}",
+            log_path.to_string_lossy(),
+            compression.get_extension()
+        ));
+        self.compress_to_path(log_path, &compressed_path)?;
         fs::remove_file(log_path).map_err(LogRollerError::FileIOError)?;
         Ok(())
+    }
+
+    /// Rename `from` → `to` if `from` exists. Otherwise do nothing.
+    fn rename_if_exists(from: &Path, to: &Path) -> Result<(), LogRollerError> {
+        match fs::rename(from, to) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(LogRollerError::RenameFileError {
+                from: from.to_path_buf(),
+                to: to.to_path_buf(),
+                error: err.to_string(),
+            }),
+        }
+    }
+
+    /// Return the numbered archive path (e.g. `app.log.1`).
+    fn get_size_based_archive_path(&self, index: usize) -> PathBuf {
+        self.directory
+            .join(format!("{}.{index}", self.filename.to_string_lossy()))
+    }
+
+    /// Return the path for a compressed numbered archive (e.g. `app.log.1.gz`).
+    fn get_size_based_compressed_archive_path(&self, index: usize, compression: &Compression) -> PathBuf {
+        self.directory.join(format!(
+            "{}.{index}.{}",
+            self.filename.to_string_lossy(),
+            compression.get_extension()
+        ))
+    }
+
+    /// Temporary path used while compressing a pending file before it is
+    /// atomically renamed into the archive namespace.
+    fn get_size_based_compression_temp_path(&self, pending_log_path: &Path, compression: &Compression) -> PathBuf {
+        PathBuf::from(format!(
+            "{}.{}.tmp",
+            pending_log_path.to_string_lossy(),
+            compression.get_extension()
+        ))
+    }
+
+    /// Parse the numeric archive index from a size-based file name.
+    ///
+    /// Handles plain archives (`app.log.1` → `Some(1)`) and compressed
+    /// archives (`app.log.1.gz` → `Some(1)`). Returns `None` for filenames
+    /// with fewer than two dot-separated parts.
+    fn parse_size_based_archive_index(file_name: &str) -> Option<usize> {
+        let mut parts: Vec<&str> = file_name.split('.').collect();
+        if parts.len() < 2 {
+            return None;
+        }
+        if parts.last().and_then(|segment| segment.parse::<usize>().ok()).is_none() {
+            parts.pop();
+        }
+        parts.last().and_then(|segment| segment.parse::<usize>().ok())
+    }
+
+    /// Find the highest archive index currently on disk for size-based
+    /// rotation.
+    fn max_size_based_archive_index(&self) -> Result<usize, LogRollerError> {
+        let all_log_files = Self::list_all_files(
+            &self.directory,
+            self.file_pattern.as_ref().expect("file_pattern not initialized"),
+        )?;
+
+        let mut max_index = 0;
+        for file in all_log_files {
+            if let Some(index) = file
+                .path()
+                .file_name()
+                .and_then(|s| s.to_str())
+                .and_then(Self::parse_size_based_archive_index)
+            {
+                max_index = max_index.max(index);
+            }
+        }
+        Ok(max_index)
+    }
+
+    /// Shift all existing numbered archives up by one index so that position
+    /// `1` is free for the newly rotated file. Both uncompressed and compressed
+    /// archives are shifted together.
+    fn shift_size_based_archives(&self) -> Result<(), LogRollerError> {
+        let max_index = self.max_size_based_archive_index()?;
+        for idx in (1..=max_index).rev() {
+            let source_file = self.get_size_based_archive_path(idx);
+            let target_file = self.get_size_based_archive_path(idx + 1);
+            Self::rename_if_exists(&source_file, &target_file)?;
+
+            if let Some(compression) = &self.compression {
+                let compressed_source_file = self.get_size_based_compressed_archive_path(idx, compression);
+                let compressed_target_file = self.get_size_based_compressed_archive_path(idx + 1, compression);
+                Self::rename_if_exists(&compressed_source_file, &compressed_target_file)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove archive files whose index exceeds `max_keep_files`.
+    fn prune_size_based_archives(&self) -> Result<(), LogRollerError> {
+        let Some(max_keep_files) = self.max_keep_files else {
+            return Ok(());
+        };
+
+        let all_log_files = Self::list_all_files(
+            &self.directory,
+            self.file_pattern.as_ref().expect("file_pattern not initialized"),
+        )?;
+
+        for file in all_log_files {
+            if let Some(index) = file
+                .path()
+                .file_name()
+                .and_then(|s| s.to_str())
+                .and_then(Self::parse_size_based_archive_index)
+            {
+                if index > max_keep_files as usize {
+                    let path = file.path();
+                    if let Err(err) = fs::remove_file(&path) {
+                        eprintln!("Failed to remove old log file '{}': {}", path.display(), err);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Process a pending size-based rotation: compress (if configured),
+    /// shift existing archives up by one, rename the pending file into
+    /// position `1`, and prune anything beyond `max_keep_files`.
+    fn publish_size_based_log(&self, pending_log_path: &PathBuf) -> Result<(), LogRollerError> {
+        match &self.compression {
+            Some(compression) => {
+                let compressed_pending_path = self.get_size_based_compression_temp_path(pending_log_path, compression);
+                self.compress_to_path(pending_log_path, &compressed_pending_path)?;
+                fs::remove_file(pending_log_path).map_err(LogRollerError::FileIOError)?;
+
+                self.shift_size_based_archives()?;
+
+                let target_path = self.get_size_based_compressed_archive_path(1, compression);
+                fs::rename(&compressed_pending_path, &target_path).map_err(|err| LogRollerError::RenameFileError {
+                    from: compressed_pending_path.clone(),
+                    to: target_path.clone(),
+                    error: err.to_string(),
+                })?;
+            }
+            None => {
+                self.shift_size_based_archives()?;
+
+                let target_path = self.get_size_based_archive_path(1);
+                Self::rename_if_exists(pending_log_path, &target_path)?;
+            }
+        }
+        self.prune_size_based_archives()
     }
 
     /// Set the permissions for a file based on the configured file mode.
@@ -681,72 +924,33 @@ impl LogRollerMeta {
     /// Refresh the writer.
     /// This function will refresh the writer by creating a new log file and
     /// compressing the old log file. The function will also rename the
-    /// existing log files based on the rotation type.
+    /// Swap the writer from `old_log_path` to `rotated_log_path`. Flushes
+    /// the old file, creates the new one, and returns the path of the old
+    /// file for the post-rotation compression thread.
+    ///
+    /// For size-based rotation, `rotated_log_path` is the pending path
+    /// (`file.pending.{N}`). The caller is responsible for spawning the
+    /// compression thread that calls `process_old_logs`, which handles
+    /// archive shifting, final rename, and pruning.
     fn refresh_writer(
         &self,
         writer: &mut fs::File,
         old_log_path: PathBuf,
-        new_log_path: PathBuf,
-        next_size_based_index: usize,
-        compression: &Option<Compression>,
-    ) -> Result<JoinHandle<()>, LogRollerError> {
-        let meta = self.to_owned();
-        let handle = match &self.rotation {
+        rotated_log_path: PathBuf,
+    ) -> Result<PathBuf, LogRollerError> {
+        match &self.rotation {
             Rotation::SizeBased(_) => {
                 let curr_log_path = self.directory.join(&self.filename);
 
-                // 1. Rename the existing log files.
-                // If target file exists, it will be overwritten
-                for idx in (1..next_size_based_index).rev() {
-                    // Rename original file
-                    let source_file = self
-                        .directory
-                        .join(format!("{}.{}", self.filename.to_string_lossy(), idx));
-                    let target_file = self
-                        .directory
-                        .join(format!("{}.{}", self.filename.to_string_lossy(), idx + 1));
-                    if source_file.exists() {
-                        std::fs::rename(&source_file, &target_file).map_err(|err| LogRollerError::RenameFileError {
-                            from: source_file.clone(),
-                            to: target_file.clone(),
-                            error: err.to_string(),
-                        })?;
-                    }
-
-                    // Rename compressed file
-                    if let Some(compression) = &compression {
-                        let compressed_source_file = self.directory.join(format!(
-                            "{}.{}.{}",
-                            self.filename.to_string_lossy(),
-                            idx,
-                            compression.get_extension()
-                        ));
-                        let compressed_target_file = self.directory.join(format!(
-                            "{}.{}.{}",
-                            self.filename.to_string_lossy(),
-                            idx + 1,
-                            compression.get_extension()
-                        ));
-                        if compressed_source_file.exists() {
-                            std::fs::rename(&compressed_source_file, &compressed_target_file).map_err(|err| {
-                                LogRollerError::RenameFileError {
-                                    from: compressed_source_file.clone(),
-                                    to: compressed_target_file.clone(),
-                                    error: err.to_string(),
-                                }
-                            })?;
-                        }
-                    }
-                }
-
-                // 2. Rename the current log file
-                std::fs::rename(&curr_log_path, &new_log_path).map_err(|err| LogRollerError::RenameFileError {
+                // Move the current log to a stable pending path. The
+                // compression thread owns publication into the numbered
+                // archive namespace.
+                std::fs::rename(&curr_log_path, &rotated_log_path).map_err(|err| LogRollerError::RenameFileError {
                     from: curr_log_path.clone(),
-                    to: new_log_path.clone(),
+                    to: rotated_log_path.clone(),
                     error: err.to_string(),
                 })?;
 
-                // 3. Create a new log file and ensure proper cleanup on failure
                 let new_log_file = match self.create_log_file(&curr_log_path) {
                     Ok(file) => file,
                     Err(err) => {
@@ -755,57 +959,36 @@ impl LogRollerMeta {
                     }
                 };
 
-                // 4. Only update writer after successful file creation
                 if let Err(err) = writer.flush() {
                     eprintln!("Failed to flush writer: {err}");
                     return Err(LogRollerError::FileIOError(err));
                 }
                 *writer = new_log_file;
 
-                // 5. Process old logs in a separate thread (sequentially)
-                std::thread::spawn(move || {
-                    if let Err(err) = meta.process_old_logs(&new_log_path) {
-                        eprintln!(
-                            "Failed to process old log files for '{}': {}",
-                            new_log_path.display(),
-                            err
-                        );
-                    }
-                })
+                Ok(rotated_log_path)
             }
             Rotation::AgeBased(_) => {
-                // 1. Create the new log file first
-                let new_log_file = match self.create_log_file(&new_log_path) {
+                let new_log_file = match self.create_log_file(&rotated_log_path) {
                     Ok(file) => file,
                     Err(err) => {
-                        // Failed to create new file - keep using the existing one
-                        eprintln!("Failed to create new log file '{}': {}", new_log_path.display(), err);
+                        eprintln!(
+                            "Failed to create new log file '{}': {}",
+                            rotated_log_path.display(),
+                            err
+                        );
                         return Err(err);
                     }
                 };
 
-                // 2. Flush the existing writer before switching
                 if let Err(err) = writer.flush() {
-                    eprintln!("Failed to flush writer for '{}': {}", new_log_path.display(), err);
+                    eprintln!("Failed to flush writer for '{}': {}", rotated_log_path.display(), err);
                     return Err(LogRollerError::FileIOError(err));
                 }
-
-                // 3. Update writer with new file only after successful flush
                 *writer = new_log_file;
 
-                // 4. Process old logs in a separate thread (sequentially)
-                std::thread::spawn(move || {
-                    if let Err(err) = meta.process_old_logs(&old_log_path) {
-                        eprintln!(
-                            "Failed to process old log files for '{}': {}",
-                            old_log_path.display(),
-                            err
-                        );
-                    }
-                })
+                Ok(old_log_path)
             }
-        };
-        Ok(handle)
+        }
     }
 }
 
@@ -831,6 +1014,41 @@ impl LogRollerMeta {
             suffix: None,
             file_mode: None,
             graceful_shutdown: false,
+            file_pattern: None,
+        }
+    }
+
+    /// Build the regex pattern used to match archive file names for the
+    /// current rotation strategy. Called once during build.
+    fn build_file_pattern(
+        filename: &str,
+        rotation: &Rotation,
+        file_suffix: &Option<String>,
+        compression: &Option<Compression>,
+    ) -> Result<Regex, LogRollerError> {
+        let file_suffix = file_suffix.as_ref().map(|s| format!("(.{s})?")).unwrap_or_default();
+        let compression_suffix = compression
+            .as_ref()
+            .map(|c| format!("(.{})?", c.get_extension()))
+            .unwrap_or_default();
+
+        let escaped_filename = regex::escape(filename);
+        match rotation {
+            Rotation::SizeBased(_) => {
+                Regex::new(&format!(r"^{escaped_filename}\.\d+{file_suffix}{compression_suffix}$"))
+                    .map_err(|err| LogRollerError::InternalError(err.to_string()))
+            }
+            Rotation::AgeBased(rotation_age) => {
+                let pattern = match rotation_age {
+                    RotationAge::Minutely => r"\d{4}-\d{2}-\d{2}-\d{2}-\d{2}",
+                    RotationAge::Hourly => r"\d{4}-\d{2}-\d{2}-\d{2}",
+                    RotationAge::Daily => r"\d{4}-\d{2}-\d{2}",
+                };
+                Regex::new(&format!(
+                    r"^{escaped_filename}\.{pattern}{file_suffix}{compression_suffix}$"
+                ))
+                .map_err(|err| LogRollerError::InternalError(err.to_string()))
+            }
         }
     }
 
@@ -850,6 +1068,15 @@ impl LogRollerMeta {
             RotationAge::Hourly => path_fn("%Y-%m-%d-%H"),
             RotationAge::Daily => path_fn("%Y-%m-%d"),
         }
+    }
+
+    /// Return the temporary path for a pending size-based rotation.
+    /// Pending files use the format `{filename}.pending.{sequence}` so each
+    /// rotation gets a unique, stable identity that won't collide with
+    /// subsequent rotations.
+    fn get_pending_log_path(&self, sequence: u64) -> PathBuf {
+        self.directory
+            .join(format!("{}.pending.{sequence}", self.filename.to_string_lossy()))
     }
 
     /// Get the current log file path.
@@ -1049,13 +1276,18 @@ impl LogRollerBuilder {
     }
 
     /// Build the log roller.
-    pub fn build(self) -> Result<LogRoller, LogRollerError> {
+    pub fn build(mut self) -> Result<LogRoller, LogRollerError> {
+        // Pre-compile the file-name regex so directory scans never rebuild it.
+        self.meta.file_pattern = Some(LogRollerMeta::build_file_pattern(
+            self.meta.filename.as_path().as_os_str().to_string_lossy().as_ref(),
+            &self.meta.rotation,
+            &self.meta.suffix,
+            &self.meta.compression,
+        )?);
+
         let curr_file_path = self.meta.get_curr_log_path();
-        let mut next_size_based_index =
-            LogRollerState::get_next_size_based_index(&self.meta.directory, &self.meta.filename);
-        if let Some(max_keep_files) = self.meta.max_keep_files {
-            next_size_based_index = next_size_based_index.min(max_keep_files as usize);
-        }
+        let next_pending_sequence =
+            LogRollerState::get_next_pending_sequence(&self.meta.directory, &self.meta.filename);
 
         // Error checking for invalid compression level.
         #[cfg(feature = "xz")]
@@ -1067,7 +1299,7 @@ impl LogRollerBuilder {
         Ok(LogRoller {
             meta: self.meta.to_owned(),
             state: LogRollerState {
-                next_size_based_index,
+                next_pending_sequence,
                 next_age_based_time: self.meta.next_time(
                     self.meta.now(),
                     match &self.meta.rotation {
@@ -1080,84 +1312,93 @@ impl LogRollerBuilder {
                     &self.meta.directory.join(&self.meta.filename),
                 ),
             },
-            writer: RwLock::new(self.meta.create_log_file(&curr_file_path)?),
-            compressing_handle: None,
+            writer: self.meta.create_log_file(&curr_file_path)?,
+            worker_tx: None,
+            worker_handle: None,
         })
     }
 }
 
 #[allow(clippy::io_other_error)]
 impl io::Write for LogRoller {
+    /// Write a buffer to the log file, rotating first if the pending data would
+    /// exceed the threshold.
+    ///
+    /// Rotation happens **before** the write so messages land in the correct
+    /// file for their time period. Post-rotation work (compression, archive
+    /// shifting, pruning) is always handed off to the background worker so it
+    /// never blocks the write path.
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let writer = self.writer.get_mut().unwrap_or_else(PoisonError::into_inner);
+        if let Some(new_log_path) = Self::should_rollover(&self.meta, &self.state, buf.len() as u64) {
+            let old_log_path = self.state.curr_file_path.clone();
+            let rotated_log_path = match &self.meta.rotation {
+                Rotation::SizeBased(_) => {
+                    let pending_log_path = self.meta.get_pending_log_path(self.state.next_pending_sequence);
+                    self.state.next_pending_sequence += 1;
+                    pending_log_path
+                }
+                Rotation::AgeBased(_) => new_log_path.to_owned(),
+            };
+            let rotated_path = self
+                .meta
+                .refresh_writer(&mut self.writer, old_log_path, rotated_log_path)
+                .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
 
-        let old_log_path = self.state.curr_file_path.to_owned();
-        let next_size_based_index = self.state.next_size_based_index;
-        let compression = self.meta.compression.to_owned();
+            self.post_rotation(rotated_path);
 
-        // If compression thread still running, skip rotation check and write directly.
-        let compressing = self
-            .compressing_handle
-            .as_ref()
-            .is_some_and(|h| !h.is_finished());
-
-        // Check rotation before writing so log entries always land in the
-        // correct time/size-bound file.
-        if !compressing {
-            if let Some(new_log_path) =
-                Self::should_rollover(&self.meta, &self.state, buf.len() as u64)
-            {
-                let handle = self
-                    .meta
-                    .refresh_writer(
-                        writer,
-                        old_log_path,
-                        new_log_path.to_owned(),
-                        next_size_based_index,
-                        &compression,
-                    )
-                    .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
-                self.compressing_handle = Some(handle);
-                self.state.curr_file_path.clone_from(&new_log_path);
-
-                match &self.meta.rotation {
-                    Rotation::SizeBased(_) => {
-                        self.state.curr_file_size_bytes = 0;
-                        self.state.next_size_based_index += 1;
-                        if let Some(max_keep_files) = self.meta.max_keep_files {
-                            self.state.next_size_based_index =
-                                self.state.next_size_based_index.min(max_keep_files as usize);
-                        }
-                    }
-                    Rotation::AgeBased(rotation_age) => {
-                        self.state.curr_file_size_bytes = 0;
-                        self.state.next_age_based_time = self
-                            .meta
-                            .next_time(self.meta.now(), rotation_age.to_owned())
-                            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
-                    }
+            match &self.meta.rotation {
+                Rotation::SizeBased(_) => {
+                    self.state.curr_file_size_bytes = 0;
+                    self.state.curr_file_path = self.meta.get_curr_log_path();
+                }
+                Rotation::AgeBased(rotation_age) => {
+                    self.state.curr_file_size_bytes = 0;
+                    self.state.curr_file_path = new_log_path;
+                    self.state.next_age_based_time = self
+                        .meta
+                        .next_time(self.meta.now(), rotation_age.to_owned())
+                        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
                 }
             }
         }
 
-        // Write to the (possibly new) current file
-        let bytes = writer.write(buf)?;
-        self.state.curr_file_size_bytes += bytes as u64;
-        Ok(bytes)
+        self.writer.write_all(buf)?;
+        self.state.curr_file_size_bytes += buf.len() as u64;
+        Ok(buf.len())
     }
 
+    /// Flush data to the kernel page cache.
+    ///
+    /// When `graceful_shutdown` is enabled, this also drains the post-rotation
+    /// worker so all compression and pruning completes before returning.
     fn flush(&mut self) -> io::Result<()> {
-        self.writer.get_mut().unwrap_or_else(PoisonError::into_inner).flush()?;
+        self.writer.flush()?;
 
-        // Skips waiting for thread to finish if graceful_shutdown == false
-        if !self.meta.graceful_shutdown {
-            return Ok(());
-        }
-
-        if let Some(handle) = self.compressing_handle.take() {
-            let _ = handle.join();
+        if self.meta.graceful_shutdown {
+            // Drop the sender so the worker sees Disconnected, drains any
+            // remaining jobs, and exits.
+            self.worker_tx = None;
+            Self::join_worker(&mut self.worker_handle, "graceful flush");
         }
         Ok(())
+    }
+}
+
+impl Drop for LogRoller {
+    fn drop(&mut self) {
+        // Flush to the kernel page cache. The kernel will write it to disk on
+        // its normal schedule (~30 s). Only kernel panic or power loss can
+        // defeat the page cache — a process crash is safe.
+        if let Err(e) = self.writer.flush() {
+            eprintln!("LogRoller: failed to flush writer on drop: {e}");
+        }
+
+        // Signal the worker to drain and exit.
+        self.worker_tx = None;
+
+        if self.meta.graceful_shutdown {
+            Self::join_worker(&mut self.worker_handle, "drop");
+        }
     }
 }
 
