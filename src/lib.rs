@@ -377,7 +377,7 @@ impl LogRollerState {
     /// * `filename` - The name of the log file.
     /// # Returns
     /// The next pending sequence number for the log file.
-    fn get_next_pending_sequence(directory: &PathBuf, filename: &Path) -> u64 {
+    fn get_next_pending_sequence(directory: &Path, filename: &Path) -> u64 {
         let mut max_suffix: u64 = 0;
 
         // This is redundant since std::fs::read_dir already check for directory
@@ -603,7 +603,7 @@ impl LogRollerMeta {
     /// Entry point for all post-rotation work. Dispatches on rotation strategy:
     /// size-based → publish into numbered archive namespace; age-based →
     /// compress the old file and prune excess archives.
-    fn process_old_logs(&self, log_path: &PathBuf) -> Result<(), LogRollerError> {
+    fn process_old_logs(&self, log_path: &Path) -> Result<(), LogRollerError> {
         match &self.rotation {
             Rotation::SizeBased(_) => self.publish_size_based_log(log_path),
             Rotation::AgeBased(_) => {
@@ -647,7 +647,7 @@ impl LogRollerMeta {
     /// List all log files in the directory.
     /// List all log files in the directory matching `file_pattern`.
     /// Results are sorted alphabetically by file name.
-    fn list_all_files(directory: &PathBuf, file_pattern: &Regex) -> Result<Vec<DirEntry>, LogRollerError> {
+    fn list_all_files(directory: &Path, file_pattern: &Regex) -> Result<Vec<DirEntry>, LogRollerError> {
         let files = match fs::read_dir(directory) {
             Ok(files) => files,
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -658,11 +658,12 @@ impl LogRollerMeta {
         for file in files.flatten() {
             // Check the cheap regex match first — only call metadata()
             // (a filesystem syscall) on entries that match the pattern.
-            if file
-                .file_name()
-                .to_str()
-                .map_or(true, |name| !file_pattern.is_match(name))
-            {
+            let file_name = file.file_name();
+            let file_name_str = match file_name.to_str() {
+                Some(name) => name,
+                None => continue,
+            };
+            if !file_pattern.is_match(file_name_str) {
                 continue;
             }
             let metadata = match file.metadata() {
@@ -712,7 +713,7 @@ impl LogRollerMeta {
 
     /// Compress `log_path` in-place: write a compressed sibling, then remove
     /// the original. Used for age-based rotation.
-    fn compress(&self, log_path: &PathBuf) -> Result<(), LogRollerError> {
+    fn compress(&self, log_path: &Path) -> Result<(), LogRollerError> {
         let compression = match &self.compression {
             Some(c) => c,
             None => return Ok(()),
@@ -863,7 +864,7 @@ impl LogRollerMeta {
     /// Process a pending size-based rotation: compress (if configured),
     /// shift existing archives up by one, rename the pending file into
     /// position `1`, and prune anything beyond `max_keep_files`.
-    fn publish_size_based_log(&self, pending_log_path: &PathBuf) -> Result<(), LogRollerError> {
+    fn publish_size_based_log(&self, pending_log_path: &Path) -> Result<(), LogRollerError> {
         match &self.compression {
             Some(compression) => {
                 let compressed_pending_path = self.get_size_based_compression_temp_path(pending_log_path, compression);
