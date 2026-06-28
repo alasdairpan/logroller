@@ -41,6 +41,8 @@ LogRoller is a Rust library for efficient log writing and file rotation. It prov
 
 Add `logroller` to your `Cargo.toml`:
 
+**MSRV:** Rust 1.67+
+
 ```toml
 # For basic logging or with tracing framework
 [dependencies]
@@ -211,7 +213,6 @@ let mut logger = LogRollerBuilder::new("./logs", "graceful.log")
 - When `graceful_shutdown` is `true`, `flush()` waits for background compression threads to complete
 - When `graceful_shutdown` is `false` (default), `flush()` returns immediately without waiting
 - Setting to `false` prevents potential hangs during shutdown but may cause compression corruption
-
 
 ## Performance Considerations 🚀
 
