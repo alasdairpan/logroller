@@ -41,7 +41,7 @@ LogRoller is a Rust library for efficient log writing and file rotation. It prov
 
 Add `logroller` to your `Cargo.toml`:
 
-**MSRV:** Rust 1.67+
+**MSRV:** Rust 1.71+
 
 ```toml
 # For basic logging or with tracing framework
