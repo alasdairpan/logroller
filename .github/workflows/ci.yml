@@ -142,6 +142,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+      - name: Generate Cargo.lock
+        run: cargo generate-lockfile
       - name: Run cargo audit
         uses: rustsec/audit-check@v2
         with:
