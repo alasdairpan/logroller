@@ -344,6 +344,10 @@ struct LogRollerMeta {
     /// Pre-compiled regex that matches archive file names for the current
     /// rotation strategy. Computed once during build.
     file_pattern: Option<Regex>,
+    /// When true, `filename` contains strftime tokens and is used as a format
+    /// string for age-based rotation paths. When false, the date pattern is
+    /// appended after the filename.
+    is_filename_template: bool,
 }
 
 /// State for the log roller.
@@ -601,7 +605,7 @@ impl LogRollerMeta {
     }
 
     /// Entry point for all post-rotation work. Dispatches on rotation strategy:
-    /// size-based → publish into numbered archive namespace; age-based →
+    /// size-based -> publish into numbered archive namespace; age-based ->
     /// compress the old file and prune excess archives.
     fn process_old_logs(&self, log_path: &Path) -> Result<(), LogRollerError> {
         match &self.rotation {
@@ -728,7 +732,7 @@ impl LogRollerMeta {
         Ok(())
     }
 
-    /// Rename `from` → `to` if `from` exists. Otherwise do nothing.
+    /// Rename `from` -> `to` if `from` exists. Otherwise do nothing.
     fn rename_if_exists(from: &Path, to: &Path) -> Result<(), LogRollerError> {
         match fs::rename(from, to) {
             Ok(()) => Ok(()),
@@ -777,8 +781,8 @@ impl LogRollerMeta {
 
     /// Parse the numeric archive index from a size-based file name.
     ///
-    /// Handles plain archives (`app.log.1` → `Some(1)`) and compressed
-    /// archives (`app.log.1.gz` → `Some(1)`). Returns `None` for filenames
+    /// Handles plain archives (`app.log.1` -> `Some(1)`) and compressed
+    /// archives (`app.log.1.gz` -> `Some(1)`). Returns `None` for filenames
     /// with fewer than two dot-separated parts.
     fn parse_size_based_archive_index(file_name: &str) -> Option<usize> {
         let mut parts: Vec<&str> = file_name.split('.').collect();
@@ -1034,6 +1038,7 @@ impl LogRollerMeta {
             file_mode: None,
             graceful_shutdown: false,
             file_pattern: None,
+            is_filename_template: false,
         }
     }
 
@@ -1044,6 +1049,7 @@ impl LogRollerMeta {
         rotation: &Rotation,
         file_suffix: &Option<String>,
         compression: &Option<Compression>,
+        is_filename_template: bool,
     ) -> Result<Regex, LogRollerError> {
         let file_suffix = file_suffix.as_ref().map(|s| format!("(.{s})?")).unwrap_or_default();
         let compression_suffix = compression
@@ -1051,42 +1057,171 @@ impl LogRollerMeta {
             .map(|c| format!("(.{})?", c.get_extension()))
             .unwrap_or_default();
 
-        let escaped_filename = regex::escape(filename);
         match rotation {
             Rotation::SizeBased(_) => {
+                let escaped_filename = regex::escape(filename);
                 Regex::new(&format!(r"^{escaped_filename}\.\d+{file_suffix}{compression_suffix}$"))
                     .map_err(|err| LogRollerError::InternalError(err.to_string()))
             }
             Rotation::AgeBased(rotation_age) => {
-                let pattern = match rotation_age {
-                    RotationAge::Minutely => r"\d{4}-\d{2}-\d{2}-\d{2}-\d{2}",
-                    RotationAge::Hourly => r"\d{4}-\d{2}-\d{2}-\d{2}",
-                    RotationAge::Daily => r"\d{4}-\d{2}-\d{2}",
+                let pattern = if is_filename_template {
+                    Self::template_to_regex(filename)
+                } else {
+                    let escaped_filename = regex::escape(filename);
+                    let date_pattern = match rotation_age {
+                        RotationAge::Minutely => r"\d{4}-\d{2}-\d{2}-\d{2}-\d{2}",
+                        RotationAge::Hourly => r"\d{4}-\d{2}-\d{2}-\d{2}",
+                        RotationAge::Daily => r"\d{4}-\d{2}-\d{2}",
+                    };
+                    format!("{escaped_filename}\\.{date_pattern}")
                 };
-                Regex::new(&format!(
-                    r"^{escaped_filename}\.{pattern}{file_suffix}{compression_suffix}$"
-                ))
-                .map_err(|err| LogRollerError::InternalError(err.to_string()))
+                Regex::new(&format!(r"^{pattern}{file_suffix}{compression_suffix}$"))
+                    .map_err(|err| LogRollerError::InternalError(err.to_string()))
             }
         }
     }
 
+    /// Returns `true` if `s` contains chrono strftime tokens (e.g. `%Y`, `%m`).
+    fn has_strftime_tokens(s: &str) -> bool {
+        s.contains('%')
+    }
+
+    /// Map a strftime token character to a granularity level.
+    ///
+    /// 1 = year, 2 = month, 3 = day, 4 = hour, 5 = minute, 6 = second.
+    fn token_level(token: char) -> Option<u32> {
+        match token {
+            'Y' => Some(1),
+            'm' => Some(2),
+            'd' => Some(3),
+            'H' => Some(4),
+            'M' => Some(5),
+            'S' => Some(6),
+            _ => None,
+        }
+    }
+
+    /// Validate a strftime template filename.
+    ///
+    /// Checks:
+    /// - No path separators (sub-directories are not supported).
+    /// - Every `%` is followed by a recognised strftime token.
+    /// - The finest token granularity is at least as fine as the rotation age
+    ///   (e.g. an hourly rotation needs `%H` or finer to avoid filename
+    ///   collisions within the same hour).
+    fn validate_template(template: &str, rotation_age: &RotationAge) -> Result<(), LogRollerError> {
+        if template.contains('/') || template.contains('\\') {
+            return Err(LogRollerError::InvalidFilenameTemplate(
+                "filename template must not contain path separators".into(),
+            ));
+        }
+
+        let mut finest_level: u32 = 0;
+        let mut finest_token: Option<char> = None;
+        let mut chars = template.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '%' {
+                match chars.next() {
+                    Some(tok) => match Self::token_level(tok) {
+                        Some(level) => {
+                            if level > finest_level {
+                                finest_level = level;
+                                finest_token = Some(tok);
+                            }
+                        }
+                        None => {
+                            return Err(LogRollerError::InvalidFilenameTemplate(format!(
+                                "unsupported strftime token: %{tok}"
+                            )));
+                        }
+                    },
+                    None => {
+                        return Err(LogRollerError::InvalidFilenameTemplate(
+                            "stray '%' at end of filename template".into(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        let required = match rotation_age {
+            RotationAge::Daily => 3,
+            RotationAge::Hourly => 4,
+            RotationAge::Minutely => 5,
+        };
+
+        if finest_level == 0 {
+            return Err(LogRollerError::InvalidFilenameTemplate(
+                "filename contains '%' but no recognised strftime tokens".into(),
+            ));
+        }
+        if finest_level < required {
+            let age_name = match rotation_age {
+                RotationAge::Daily => "daily",
+                RotationAge::Hourly => "hourly",
+                RotationAge::Minutely => "minutely",
+            };
+            let needed_token = match rotation_age {
+                RotationAge::Daily => "%d",
+                RotationAge::Hourly => "%H",
+                RotationAge::Minutely => "%M",
+            };
+            let found = finest_token.map_or_else(String::new, |t| format!("%{t}"));
+            return Err(LogRollerError::InvalidFilenameTemplate(format!(
+                "filename template needs {needed_token} (or finer) for {age_name} rotation, \
+                 but the finest token found is {found}",
+            )));
+        }
+        Ok(())
+    }
+
+    /// Convert a strftime template into a regex pattern.
+    ///
+    /// Maps strftime tokens to digit patterns (`%Y` -> `\d{4}`,
+    /// `%m`/`%d`/`%H`/`%M`/`%S` -> `\d{2}`) and regex-escapes literal
+    /// characters. Used to build the archive-matching regex for age-based
+    /// rotation with template filenames.
+    fn template_to_regex(template: &str) -> String {
+        let mut regex = String::new();
+        let mut chars = template.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '%' {
+                match chars.next() {
+                    Some('Y') => regex.push_str(r"\d{4}"),
+                    Some('m' | 'd' | 'H' | 'M' | 'S') => regex.push_str(r"\d{2}"),
+                    Some(other) => {
+                        // Defensive: shouldn't happen after validation.
+                        regex.push_str(&regex::escape(&format!("%{other}")));
+                    }
+                    None => break,
+                }
+            } else {
+                regex.push_str(&regex::escape(&ch.to_string()));
+            }
+        }
+        regex
+    }
+
     /// Get the next log file path based on the rotation age.
     fn get_next_age_based_log_path(&self, rotation_age: &RotationAge, datetime: &DateTime<FixedOffset>) -> PathBuf {
-        let path_fn = |pattern: &str| -> PathBuf {
-            let mut tf = datetime
+        let mut tf = if self.is_filename_template {
+            datetime
+                .format(self.filename.as_path().to_string_lossy().as_ref())
+                .to_string()
+        } else {
+            let pattern = match rotation_age {
+                RotationAge::Minutely => "%Y-%m-%d-%H-%M",
+                RotationAge::Hourly => "%Y-%m-%d-%H",
+                RotationAge::Daily => "%Y-%m-%d",
+            };
+            datetime
                 .format(&format!("{}.{pattern}", self.filename.as_path().to_string_lossy()))
-                .to_string();
-            if let Some(suffix) = &self.suffix {
-                tf = format!("{tf}.{suffix}");
-            }
-            self.directory.join(PathBuf::from(tf))
+                .to_string()
         };
-        match rotation_age {
-            RotationAge::Minutely => path_fn("%Y-%m-%d-%H-%M"),
-            RotationAge::Hourly => path_fn("%Y-%m-%d-%H"),
-            RotationAge::Daily => path_fn("%Y-%m-%d"),
+        if let Some(suffix) = &self.suffix {
+            tf = format!("{tf}.{suffix}");
         }
+        self.directory.join(PathBuf::from(tf))
     }
 
     /// Return the temporary path for a pending size-based rotation.
@@ -1128,6 +1263,8 @@ pub enum LogRollerError {
     ShouldNotRotate(PathBuf),
     #[error("Internal error: {0}")]
     InternalError(String),
+    #[error("Invalid filename template: {0}")]
+    InvalidFilenameTemplate(String),
     #[error("Failed to set file permissions for '{path}': {error}")]
     SetFilePermissionsError { path: PathBuf, error: String },
     #[cfg(feature = "xz")]
@@ -1203,6 +1340,15 @@ impl LogRollerBuilder {
     /// # Arguments
     /// * `directory` - The directory where the log files are stored.
     /// * `filename` - The name of the log file.
+    ///
+    /// For age-based rotation, the filename may contain a subset of chrono
+    /// [strftime tokens](https://docs.rs/chrono/latest/chrono/format/strftime/index.html)
+    /// to control how timestamps appear in rotated file names (only `%Y`, `%m`, `%d`, `%H`,
+    /// `%M`, `%S` are supported).
+    ///
+    /// E.g. `%Y-%m-%d.log` produces `2026-06-29.log`.
+    /// When no `%` tokens are present, the date is appended to the filename
+    /// (e.g. `app.log` -> `app.log.2026-06-29`).
     pub fn new<P: AsRef<Path>>(directory: P, filename: P) -> Self {
         LogRollerBuilder {
             meta: LogRollerMeta::new(directory, filename),
@@ -1296,12 +1442,32 @@ impl LogRollerBuilder {
 
     /// Build the log roller.
     pub fn build(mut self) -> Result<LogRoller, LogRollerError> {
+        // Detect and validate strftime templates in the filename.
+        // Templates only apply to age-based rotation.
+        let filename_str = self.meta.filename.as_path().to_string_lossy();
+        let is_template = LogRollerMeta::has_strftime_tokens(filename_str.as_ref());
+
+        if is_template {
+            match &self.meta.rotation {
+                Rotation::AgeBased(rotation_age) => {
+                    LogRollerMeta::validate_template(filename_str.as_ref(), rotation_age)?;
+                }
+                _ => {
+                    return Err(LogRollerError::InvalidFilenameTemplate(
+                        "filename templates are only supported with age-based rotation".into(),
+                    ));
+                }
+            }
+        }
+        self.meta.is_filename_template = is_template;
+
         // Pre-compile the file-name regex so directory scans never rebuild it.
         self.meta.file_pattern = Some(LogRollerMeta::build_file_pattern(
-            self.meta.filename.as_path().as_os_str().to_string_lossy().as_ref(),
+            filename_str.as_ref(),
             &self.meta.rotation,
             &self.meta.suffix,
             &self.meta.compression,
+            self.meta.is_filename_template,
         )?);
 
         let curr_file_path = self.meta.get_curr_log_path();
